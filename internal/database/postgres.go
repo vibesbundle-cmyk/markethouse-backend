@@ -349,6 +349,10 @@ func runSelfHealingMigrations(db *sql.DB) error {
 		`DO $$ BEGIN
 			IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='communities' AND column_name='owner_id') THEN
 				UPDATE communities SET created_by = owner_id WHERE created_by IS NULL;
+				-- vinci.sql's legacy definition made owner_id NOT NULL with no
+				-- default, but the create handler only writes created_by — so
+				-- INSERTs would fail on fresh databases. Make it nullable.
+				ALTER TABLE communities ALTER COLUMN owner_id DROP NOT NULL;
 			END IF;
 			IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='communities' AND column_name='type') THEN
 				UPDATE communities SET visibility = type WHERE type IS NOT NULL;

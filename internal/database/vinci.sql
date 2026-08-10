@@ -564,7 +564,7 @@ CREATE TABLE IF NOT EXISTS communities (
   member_count INTEGER DEFAULT 0,
   post_count   INTEGER DEFAULT 0,
   type         TEXT NOT NULL DEFAULT 'public', -- public | private | restricted
-  owner_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  owner_id     INTEGER REFERENCES users(id) ON DELETE CASCADE,
   created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -823,7 +823,7 @@ CREATE TABLE IF NOT EXISTS communities (
   icon         TEXT,
   tags         TEXT,
   visibility   TEXT NOT NULL DEFAULT 'public', -- public | private | restricted
-  owner_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  owner_id     INTEGER REFERENCES users(id) ON DELETE CASCADE,
   member_count INTEGER DEFAULT 0,
   created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
