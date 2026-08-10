@@ -11,6 +11,7 @@ import (
 
 type PostHandler struct {
 	Service *services.PostService
+	Hub     *services.Hub
 }
 
 // CREATE POST
@@ -44,6 +45,12 @@ func (h *PostHandler) CreatePost(c *gin.Context) {
 		log.Printf("[POST] create error user=%d: %v", userID, err)
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
+	}
+
+	if h.Hub != nil {
+		h.Hub.Broadcast(map[string]interface{}{
+			"type": "post_created", "user_id": userID, "post_id": post.ID,
+		})
 	}
 
 	c.JSON(200, post)

@@ -230,6 +230,11 @@ func (h *CommunityHandler) Join(c *gin.Context) {
 	h.DB.Exec(`INSERT INTO community_members(community_id,user_id) VALUES($1,$2)
 		ON CONFLICT(community_id,user_id) DO UPDATE SET status='active'`, commID, userID)
 	h.DB.Exec(`UPDATE communities SET member_count=member_count+1 WHERE id=$1`, commID)
+	if h.Hub != nil {
+		h.Hub.Broadcast(map[string]interface{}{
+			"type": "community_join", "community_id": commID, "user_id": userID, "joined": true,
+		})
+	}
 	c.JSON(200, gin.H{"ok": true})
 }
 
@@ -239,6 +244,11 @@ func (h *CommunityHandler) Leave(c *gin.Context) {
 	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
 	h.DB.Exec(`UPDATE community_members SET status='inactive' WHERE community_id=$1 AND user_id=$2`, commID, userID)
 	h.DB.Exec(`UPDATE communities SET member_count=GREATEST(0,member_count-1) WHERE id=$1`, commID)
+	if h.Hub != nil {
+		h.Hub.Broadcast(map[string]interface{}{
+			"type": "community_join", "community_id": commID, "user_id": userID, "joined": false,
+		})
+	}
 	c.JSON(200, gin.H{"ok": true})
 }
 

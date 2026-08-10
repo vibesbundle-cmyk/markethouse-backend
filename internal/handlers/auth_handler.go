@@ -17,6 +17,7 @@ import (
 
 type AuthHandler struct {
 	Service *services.AuthService
+	Hub     *services.Hub
 }
 
 // ---------------- SIGNUP ----------------
@@ -126,6 +127,11 @@ func (h *AuthHandler) UploadImage(c *gin.Context) {
 	}
 
 	log.Printf("[UPLOAD] success user %d type=%s url=%s", userID, uploadType, url)
+	if h.Hub != nil {
+		h.Hub.SendToUser(userID, map[string]interface{}{
+			"type": "profile_updated", "user_id": userID, "upload_type": uploadType, "url": url,
+		})
+	}
 	c.JSON(200, gin.H{"url": url})
 }
 

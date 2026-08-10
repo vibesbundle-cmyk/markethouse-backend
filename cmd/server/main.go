@@ -91,12 +91,13 @@ func main() {
 	// ---------------- REAL-TIME HUB ----------------
 	hub := services.NewHub(redisClient)
 	go hub.Run()
+	authHandler.Hub = hub
 	wsHandler := &handlers.WSHandler{Hub: hub}
 
 	// ---------------- FOLLOW ----------------
 	followRepo := &repository.FollowRepo{DB: db}
 	followService := &services.FollowService{Repo: followRepo}
-	followHandler := &handlers.FollowHandler{Service: followService}
+	followHandler := &handlers.FollowHandler{Service: followService, Hub: hub}
 
 	// ---------------- POST ----------------
 	postRepo := &repository.PostRepo{DB: db}
@@ -105,7 +106,7 @@ func main() {
 		AuthRepo: authRepo,
 		Storage:  storageClient,
 	}
-	postHandler := &handlers.PostHandler{Service: postService}
+	postHandler := &handlers.PostHandler{Service: postService, Hub: hub}
 
 	// ---------------- INTERACTIONS ----------------
 	interactionRepo := &repository.InteractionRepo{DB: db}

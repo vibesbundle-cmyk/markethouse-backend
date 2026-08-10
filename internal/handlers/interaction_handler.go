@@ -184,6 +184,9 @@ func (h *InteractionHandler) Reshare(c *gin.Context) {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
+	if h.Hub != nil {
+		h.Hub.Broadcast(map[string]interface{}{"type": "post_reshare", "post_id": postID, "user_id": userID, "delta": 1})
+	}
 	c.JSON(200, gin.H{"message": "reshared"})
 }
 
@@ -197,6 +200,9 @@ func (h *InteractionHandler) Unreshare(c *gin.Context) {
 	if err := h.Service.Unreshare(userID, postID); err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
+	}
+	if h.Hub != nil {
+		h.Hub.Broadcast(map[string]interface{}{"type": "post_reshare", "post_id": postID, "user_id": userID, "delta": -1})
 	}
 	c.JSON(200, gin.H{"message": "unreshared"})
 }

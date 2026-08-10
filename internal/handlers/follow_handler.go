@@ -9,6 +9,28 @@ import (
 
 type FollowHandler struct {
 	Service *services.FollowService
+	Hub     *services.Hub
+}
+
+// notifyFollow pushes a realtime follow/unfollow event to both the actor
+// (their "following" count changed) and the target (their "followers" count
+// changed), so open profile pages update without a refresh or re-login.
+func (h *FollowHandler) notifyFollow(actorID, targetID int64, following bool) {
+	if h.Hub == nil {
+		return
+	}
+	payload := map[string]interface{}{
+		"type":       "follow",
+		"user_id":    targetID,
+		"actor_id":   actorID,
+		"following":  following,
+		"delta":      1,
+	}
+	if !following {
+		payload["delta"] = -1
+	}
+	h.Hub.SendToUser(targetID, payload)
+	h.Hub.SendToUser(actorID, payload)
 }
 
 // FOLLOW
@@ -28,6 +50,7 @@ func (h *FollowHandler) Follow(c *gin.Context) {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
+	h.notifyFollow(userID, req.UserID, true)
 	c.JSON(200, gin.H{"message": "followed"})
 }
 
@@ -44,6 +67,7 @@ func (h *FollowHandler) Unfollow(c *gin.Context) {
 	}
 
 	h.Service.UnfollowUser(userID, req.UserID)
+	h.notifyFollow(userID, req.UserID, false)
 	c.JSON(200, gin.H{"message": "unfollowed"})
 }
 
