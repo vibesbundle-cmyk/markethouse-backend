@@ -15,11 +15,10 @@ redis:
 services:
   - type: web
     name: markethouse-api
-    runtime: go
+    runtime: docker
     plan: free
     region: oregon
-    buildCommand: go build -o markethouse-api ./cmd/server
-    startCommand: ./markethouse-api
+    dockerfilePath: ./Dockerfile
     envVars:
       - key: DATABASE_URL
         fromDatabase:
