@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS posts (
   post_type   TEXT DEFAULT 'public',
   price       NUMERIC DEFAULT 0,
   is_locked   BOOLEAN DEFAULT false,
+  tagged_users TEXT NOT NULL DEFAULT '',
   created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE

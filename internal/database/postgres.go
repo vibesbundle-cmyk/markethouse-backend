@@ -380,6 +380,11 @@ func runSelfHealingMigrations(db *sql.DB) error {
 		`ALTER TABLE posts ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'Other'`,
 		`ALTER TABLE posts ADD COLUMN IF NOT EXISTS quality_score NUMERIC(10,2) DEFAULT 0`,
 		`ALTER TABLE posts ADD COLUMN IF NOT EXISTS distribution_stage INTEGER DEFAULT 1`,
+		// posts: post_repo.go and interaction_repo.go SELECT/INSERT p.tagged_users,
+		// but no migration ever added the column — so any DB bootstrapped from
+		// vinci.sql alone (like the production Render DB) 500s on every feed and
+		// post create. This column already exists on long-lived local DBs.
+		`ALTER TABLE posts ADD COLUMN IF NOT EXISTS tagged_users TEXT NOT NULL DEFAULT ''`,
 
 		// User location (for Nearby feed)
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS latitude  DOUBLE PRECISION`,
