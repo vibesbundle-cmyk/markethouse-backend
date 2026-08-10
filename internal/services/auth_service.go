@@ -91,6 +91,15 @@ func (s *AuthService) Signup(user models.User) error {
 	}
 
 	if s.Repo.EmailExists(user.Email) {
+		// The account may already exist from an interrupted signup that never
+		// completed verification. Let them verify it instead of rejecting.
+		existing, err := s.Repo.GetUserByEmailOrMobile(user.Email)
+		if err == nil && !existing.IsVerified && !existing.IsPhoneVerified {
+			otp := generateOTP()
+			s.Redis.Set(bgCtx, "otp:email:"+user.Email, otp, 5*time.Minute)
+			go utils.SendEmail(user.Email, "Your Market House verification code is: "+otp)
+			return nil
+		}
 		return errors.New("user already exists (email)")
 	}
 
