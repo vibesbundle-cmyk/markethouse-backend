@@ -12,6 +12,9 @@ services:
   - type: redis
     name: markethouse-redis
     plan: free
+    ipAllowList: # Required for Key Value (Redis) instances
+      - source: 0.0.0.0/0
+        description: everywhere
 
   - type: web
     name: markethouse-api
