@@ -46,6 +46,13 @@ func (r *AuthRepo) CreateUser(user models.User) (int64, error) {
 		mobile = sql.NullString{String: user.Mobile, Valid: true}
 	}
 
+	// dob is a DATE column — an empty string is not valid date syntax,
+	// so map it to NULL instead of passing '' through.
+	var dob sql.NullString
+	if user.DOB != "" {
+		dob = sql.NullString{String: user.DOB, Valid: true}
+	}
+
 	err := r.DB.QueryRow(`
 	INSERT INTO users
 	(full_name, email, mobile, password, dob, gender, username, profile_photo, header_photo, bio, account_type, is_verified, is_phone_verified)
@@ -56,7 +63,7 @@ func (r *AuthRepo) CreateUser(user models.User) (int64, error) {
 		user.Email,
 		mobile,
 		user.Password,
-		user.DOB,
+		dob,
 		user.Gender,
 		user.Username,
 		user.ProfilePhoto,
