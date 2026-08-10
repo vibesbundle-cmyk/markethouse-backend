@@ -14,3 +14,7 @@ uploads/
 
 # Go
 vendor/
+`n# Stale Flutter leftovers`npubspec.yaml`npubspec.lock
+
+# Build/test binaries
+*.exe

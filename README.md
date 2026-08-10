@@ -23,8 +23,9 @@ git clone ... && cd markethouse
 # 2. Copy env
 cp .env.example .env        # fill in values
 
-# 3. Run SQL (idempotent — safe to re-run)
-psql -U postgres -d markethouse -f vinci.sql
+# 3. Run SQL (idempotent — safe to re-run; also applied automatically on boot
+#    to any database that doesn't have the base schema yet)
+psql -U postgres -d markethouse -f internal/database/vinci.sql
 
 # 4. Start
 go run ./cmd/server/main.go

@@ -52,6 +52,15 @@ func postgresWithMigrations(db *sql.DB) (*sql.DB, error) {
 		return nil, err
 	}
 
+	// ensureBaseSchema runs vinci.sql (embedded) on a brand-new database so
+	// the base tables (users, posts, comments, ...) exist before the other
+	// migrations touch them. On databases that already have the schema it's
+	// a no-op. Without this, a fresh Render/CI database has no base tables
+	// and every migration fails with "relation does not exist".
+	if err := ensureBaseSchema(db); err != nil {
+		return nil, fmt.Errorf("base schema (vinci.sql) failed: %w", err)
+	}
+
 	// runNewFeatureMigrations MUST run first: it CREATEs the communities/
 	// community_posts/commerce_listings/... tables. runSelfHealingMigrations
 	// only ever ALTERs/adds columns to tables that already exist (community
@@ -73,6 +82,166 @@ func postgresWithMigrations(db *sql.DB) (*sql.DB, error) {
 // never 500s because someone forgot to run vinci.sql by hand after a
 // feature was added. It only ever adds columns/tables — never drops or
 // rewrites existing data.
+// ensureBaseSchema applies the embedded vinci.sql on every boot, one statement
+// at a time. vinci.sql is the project's idempotent schema script ("run this
+// whole file at any time") — every CREATE TABLE is IF NOT EXISTS and every
+// ALTER is ADD COLUMN IF NOT EXISTS, so re-running it is safe. It must be
+// executed statement-by-statement rather than as one script: the file is
+// versioned and contains multiple conflicting legacy definitions of the same
+// table (three `orders`, five `wallet_transactions`, ...). Whichever one
+// executes first wins, so later statements that reference columns that only
+// exist in the later definition fail with "column does not exist". Those are
+// expected on a fresh database; we log them as warnings and continue, then the
+// app's canonical migrations (runNewFeatureMigrations + runSelfHealingMigrations)
+// converge the schema. Statements are split with splitSQLStatements, which is
+// quote/dollar-quote aware so DO $$...$$ blocks and string literals survive.
+func ensureBaseSchema(db *sql.DB) error {
+	for _, stmt := range splitSQLStatements(vinciSchema) {
+		if _, err := db.Exec(stmt); err != nil {
+			log.Printf("warning: vinci.sql statement skipped: %v — %.120s", err, stmt)
+		}
+	}
+	return nil
+}
+
+// splitSQLStatements splits a SQL script into individual statements at
+// top-level semicolons, ignoring semicolons inside single/double-quoted
+// strings, dollar-quoted blocks ($$...$$, $tag$...$tag$), and comments.
+func splitSQLStatements(src string) []string {
+	var out []string
+	var cur strings.Builder
+	i, n := 0, len(src)
+	// state: normal | single | double | linecomment | blockcomment | dollar
+	state := "normal"
+	var tag string
+
+	for i < n {
+		c := src[i]
+		var next byte
+		if i+1 < n {
+			next = src[i+1]
+		}
+
+		switch state {
+		case "normal":
+			switch {
+			case c == '-' && next == '-':
+				state = "linecomment"
+				cur.WriteString("--")
+				i += 2
+			case c == '/' && next == '*':
+				state = "blockcomment"
+				cur.WriteString("/*")
+				i += 2
+			case c == '\'':
+				state = "single"
+				cur.WriteByte(c)
+				i++
+			case c == '"':
+				state = "double"
+				cur.WriteByte(c)
+				i++
+			case c == '$':
+				if t, ok := readDollarTag(src[i:]); ok {
+					state = "dollar"
+					tag = t
+					cur.WriteString(t)
+					i += len(t)
+				} else {
+					cur.WriteByte(c)
+					i++
+				}
+			case c == ';':
+				out = append(out, strings.TrimSpace(cur.String()))
+				cur.Reset()
+				i++
+			default:
+				cur.WriteByte(c)
+				i++
+			}
+
+		case "single":
+			cur.WriteByte(c)
+			if c == '\'' {
+				if next == '\'' {
+					cur.WriteByte('\'')
+					i += 2
+				} else {
+					state = "normal"
+					i++
+				}
+			} else {
+				i++
+			}
+
+		case "double":
+			cur.WriteByte(c)
+			if c == '"' {
+				if next == '"' {
+					cur.WriteByte('"')
+					i += 2
+				} else {
+					state = "normal"
+					i++
+				}
+			} else {
+				i++
+			}
+
+		case "linecomment":
+			cur.WriteByte(c)
+			if c == '\n' {
+				state = "normal"
+			}
+			i++
+
+		case "blockcomment":
+			cur.WriteByte(c)
+			if c == '*' && next == '/' {
+				cur.WriteByte('/')
+				i += 2
+				state = "normal"
+			} else {
+				i++
+			}
+
+		case "dollar":
+			if strings.HasPrefix(src[i:], tag) {
+				cur.WriteString(tag)
+				i += len(tag)
+				state = "normal"
+			} else {
+				cur.WriteByte(c)
+				i++
+			}
+		}
+	}
+
+	if trimmed := strings.TrimSpace(cur.String()); trimmed != "" {
+		out = append(out, trimmed)
+	}
+	return out
+}
+
+// readDollarTag returns the full dollar-quote delimiter at the start of s
+// ($, $body$, ...) and whether one was found. `$1`-style parameter markers are
+// NOT treated as dollar quotes.
+func readDollarTag(s string) (string, bool) {
+	if len(s) < 2 || s[0] != '$' {
+		return "", false
+	}
+	for j := 1; j < len(s); j++ {
+		c := s[j]
+		if c == '$' {
+			return s[:j+1], true
+		}
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_') {
+			return "", false
+		}
+	}
+	return "", false
+}
+
 func runSelfHealingMigrations(db *sql.DB) error {
 	stmts := []string{
 		// comments thread + likes
