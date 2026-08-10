@@ -40,7 +40,7 @@ services:
       # Flutter web origin(s) allowed to call the API (comma-separated).
       # Replace with your real static-site URL once the frontend is deployed.
       - key: CORS_ORIGINS
-        value: https://markethouse-web.onrender.com,https://markethouse.github.io
+        value: https://markethouse-web.onrender.com,https://markethouse.github.io,https://markethous.netlify.app
       # Set these in the Render dashboard (Environment) after deploy:
       - key: BREVO_API_KEY
         sync: false
