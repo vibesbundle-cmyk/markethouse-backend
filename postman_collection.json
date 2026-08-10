@@ -1,0 +1,412 @@
+claude{
+  "info": {
+    "name": "MarketHouse API",
+    "_postman_id": "markethouse-v2",
+    "description": "Complete API collection. Set BASE_URL variable to http://localhost:8080. Use the Login request to auto-set the TOKEN variable via the test script.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "BASE_URL", "value": "http://localhost:8080" },
+    { "key": "TOKEN", "value": "" },
+    { "key": "REFRESH_TOKEN", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "1. Auth",
+      "item": [
+        {
+          "name": "Signup (personal)",
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/signup",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"full_name\": \"Ada Obi\",\n  \"email\": \"ada@example.com\",\n  \"password\": \"Secure1234\",\n  \"dob\": \"1995-11-26\",\n  \"gender\": \"Female\",\n  \"account_type\": \"personal\",\n  \"business_type\": \"\"\n}" }
+          }
+        },
+        {
+          "name": "Signup (business - food)",
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/signup",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"full_name\": \"Chidi's Kitchen\",\n  \"email\": \"chidi@food.com\",\n  \"password\": \"Secure1234\",\n  \"dob\": \"1990-03-15\",\n  \"gender\": \"Male\",\n  \"account_type\": \"business\",\n  \"business_type\": \"food\"\n}" }
+          }
+        },
+        {
+          "name": "Verify OTP",
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/verify",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"email\": \"ada@example.com\",\n  \"otp\": \"123456\"\n}" }
+          }
+        },
+        {
+          "name": "Login",
+          "event": [{ "listen": "test", "script": { "exec": ["const r = pm.response.json();", "if (r.access_token) pm.collectionVariables.set('TOKEN', r.access_token);", "if (r.refresh_token) pm.collectionVariables.set('REFRESH_TOKEN', r.refresh_token);"] } }],
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/login",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"identifier\": \"ada@example.com\",\n  \"password\": \"Secure1234\"\n}" }
+          }
+        },
+        {
+          "name": "Refresh Token",
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/refresh",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{ \"refresh_token\": \"{{REFRESH_TOKEN}}\" }" }
+          }
+        },
+        {
+          "name": "Forgot Password",
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/forgot-password",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{ \"email\": \"ada@example.com\" }" }
+          }
+        },
+        {
+          "name": "Reset Password",
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/reset-password",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{ \"email\": \"ada@example.com\", \"otp\": \"123456\", \"new_password\": \"NewPass1234\" }" }
+          }
+        },
+        {
+          "name": "Check Username",
+          "request": { "method": "GET", "url": "{{BASE_URL}}/username/check?username=ada_obi" }
+        },
+        {
+          "name": "Resend Email OTP",
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/resend-email",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{ \"email\": \"ada@example.com\" }" }
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Profile",
+      "item": [
+        {
+          "name": "Get My Profile",
+          "request": {
+            "method": "GET", "url": "{{BASE_URL}}/profile",
+            "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }]
+          }
+        },
+        {
+          "name": "Get Public Profile",
+          "request": { "method": "GET", "url": "{{BASE_URL}}/user/ada_obi" }
+        },
+        {
+          "name": "Update Profile",
+          "request": {
+            "method": "PUT", "url": "{{BASE_URL}}/user/update",
+            "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }, { "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"full_name\": \"Ada Obi\",\n  \"username\": \"ada_obi\",\n  \"bio\": \"Food lover & entrepreneur\"\n}" }
+          }
+        },
+        {
+          "name": "Upload Profile Photo",
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/upload/profile",
+            "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }],
+            "body": { "mode": "formdata", "formdata": [{ "key": "file", "type": "file", "src": "" }] }
+          }
+        },
+        {
+          "name": "Upload Header Photo",
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/upload/header",
+            "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }],
+            "body": { "mode": "formdata", "formdata": [{ "key": "file", "type": "file", "src": "" }] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Posts & Feed",
+      "item": [
+        {
+          "name": "Create Post",
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/post",
+            "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }],
+            "body": { "mode": "formdata", "formdata": [
+              { "key": "caption", "value": "Fresh peppered snails!" },
+              { "key": "post_type", "value": "public" },
+              { "key": "file", "type": "file", "src": "" }
+            ]}
+          }
+        },
+        {
+          "name": "Public Feed",
+          "request": { "method": "GET", "url": "{{BASE_URL}}/feed/public" }
+        },
+        {
+          "name": "Following Feed",
+          "request": {
+            "method": "GET", "url": "{{BASE_URL}}/feed/following",
+            "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }]
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Interactions",
+      "item": [
+        { "name": "Love/Like Post", "request": { "method": "POST", "url": "{{BASE_URL}}/like/1", "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }] } },
+        { "name": "Unlike Post", "request": { "method": "DELETE", "url": "{{BASE_URL}}/like/1", "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }] } },
+        {
+          "name": "Reshare Post",
+          "request": { "method": "POST", "url": "{{BASE_URL}}/reshare/1", "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }] }
+        },
+        {
+          "name": "Unreshare Post",
+          "request": { "method": "DELETE", "url": "{{BASE_URL}}/reshare/1", "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }] }
+        },
+        {
+          "name": "Get Reshare Count",
+          "request": { "method": "GET", "url": "{{BASE_URL}}/reshares/1", "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }] }
+        },
+        {
+          "name": "Comment on Post",
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/comment/1",
+            "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }, { "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{ \"content\": \"This looks amazing!\" }" }
+          }
+        },
+        { "name": "Get Comments", "request": { "method": "GET", "url": "{{BASE_URL}}/comments/1", "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }] } },
+        { "name": "Save Post", "request": { "method": "POST", "url": "{{BASE_URL}}/save/1", "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }] } },
+        { "name": "Unsave Post", "request": { "method": "DELETE", "url": "{{BASE_URL}}/save/1", "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }] } }
+      ]
+    },
+    {
+      "name": "5. Follow",
+      "item": [
+        {
+          "name": "Follow User",
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/follow",
+            "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }, { "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{ \"user_id\": 2 }" }
+          }
+        },
+        {
+          "name": "Unfollow User",
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/unfollow",
+            "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }, { "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{ \"user_id\": 2 }" }
+          }
+        },
+        { "name": "Follow Stats", "request": { "method": "GET", "url": "{{BASE_URL}}/follow/stats/2", "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }] } }
+      ]
+    },
+    {
+      "name": "6. Marketplace (Supply / Demand)",
+      "item": [
+        {
+          "name": "Post Supply",
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/supply",
+            "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }],
+            "body": { "mode": "formdata", "formdata": [
+              { "key": "goods_name", "value": "Samsung TV 55\"" },
+              { "key": "category", "value": "Electronics" },
+              { "key": "condition", "value": "Used" },
+              { "key": "age_value", "value": "1" },
+              { "key": "age_unit", "value": "years" },
+              { "key": "brand", "value": "Samsung" },
+              { "key": "price", "value": "120000" },
+              { "key": "negotiable", "value": "true" },
+              { "key": "description", "value": "Samsung 55\" 4K Smart TV, barely used" },
+              { "key": "location", "value": "Port Harcourt" },
+              { "key": "latitude", "value": "4.8156" },
+              { "key": "longitude", "value": "7.0498" },
+              { "key": "delivery_radius", "value": "20" },
+              { "key": "delivery_available", "value": "true" },
+              { "key": "contact_number", "value": "08012345678" },
+              { "key": "whatsapp_number", "value": "08012345678" },
+              { "key": "photos", "type": "file", "src": "" }
+            ]}
+          }
+        },
+        { "name": "Public Supplies", "request": { "method": "GET", "url": "{{BASE_URL}}/supplies?category=Electronics" } },
+        { "name": "My Supplies", "request": { "method": "GET", "url": "{{BASE_URL}}/supplies/mine", "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }] } },
+        {
+          "name": "Post Demand",
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/demand",
+            "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }],
+            "body": { "mode": "formdata", "formdata": [
+              { "key": "looking_for", "value": "iPhone 14 Pro" },
+              { "key": "category", "value": "Electronics" },
+              { "key": "condition_pref", "value": "[\"New\",\"Like New\"]" },
+              { "key": "min_price", "value": "300000" },
+              { "key": "max_price", "value": "500000" },
+              { "key": "location", "value": "Port Harcourt" },
+              { "key": "latitude", "value": "4.8156" },
+              { "key": "longitude", "value": "7.0498" },
+              { "key": "search_radius", "value": "30" },
+              { "key": "description", "value": "Looking for a clean unit, unlocked" },
+              { "key": "urgency", "value": "Flexible" },
+              { "key": "contact_number", "value": "08098765432" },
+              { "key": "preferred_contact", "value": "WhatsApp" }
+            ]}
+          }
+        },
+        { "name": "Public Demands", "request": { "method": "GET", "url": "{{BASE_URL}}/demands" } },
+        { "name": "My Demands", "request": { "method": "GET", "url": "{{BASE_URL}}/demands/mine", "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }] } }
+      ]
+    },
+    {
+      "name": "7. Shop — Products",
+      "item": [
+        {
+          "name": "Create Product (vendor)",
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/shop/product",
+            "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }],
+            "body": { "mode": "formdata", "formdata": [
+              { "key": "name", "value": "Jollof Rice + Chicken" },
+              { "key": "description", "value": "Party jollof, smoky & rich. Comes with 1 chicken piece." },
+              { "key": "category", "value": "food" },
+              { "key": "price", "value": "3500" },
+              { "key": "stock_count", "value": "50" },
+              { "key": "is_unlimited_stock", "value": "false" },
+              { "key": "images", "type": "file", "src": "" }
+            ]}
+          }
+        },
+        {
+          "name": "Create Service Product (unlimited)",
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/shop/product",
+            "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }],
+            "body": { "mode": "formdata", "formdata": [
+              { "key": "name", "value": "Logo Design" },
+              { "key": "description", "value": "Professional logo in 3 concepts, 2 revisions." },
+              { "key": "category", "value": "service" },
+              { "key": "price", "value": "15000" },
+              { "key": "stock_count", "value": "0" },
+              { "key": "is_unlimited_stock", "value": "true" }
+            ]}
+          }
+        },
+        { "name": "Browse Products (public)", "request": { "method": "GET", "url": "{{BASE_URL}}/shop/products?category=food" } },
+        { "name": "My Products (vendor)", "request": { "method": "GET", "url": "{{BASE_URL}}/shop/products/mine", "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }] } }
+      ]
+    },
+    {
+      "name": "8. Shop — Cart",
+      "item": [
+        {
+          "name": "Add to Cart",
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/shop/cart",
+            "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }, { "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{ \"product_id\": 1, \"quantity\": 2 }" }
+          }
+        },
+        { "name": "View Cart", "request": { "method": "GET", "url": "{{BASE_URL}}/shop/cart", "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }] } },
+        { "name": "Remove Cart Item", "request": { "method": "DELETE", "url": "{{BASE_URL}}/shop/cart/1", "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }] } }
+      ]
+    },
+    {
+      "name": "9. Shop — Checkout & Payment",
+      "description": "MOCK flow: call /checkout, get reference, pass same reference to /checkout/confirm. No real money moves.",
+      "item": [
+        {
+          "name": "Step 1 — Checkout (init payment)",
+          "event": [{ "listen": "test", "script": { "exec": ["const r = pm.response.json();", "if (r.reference) pm.collectionVariables.set('PAY_REF', r.reference);"] } }],
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/shop/checkout",
+            "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }, { "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"product_id\": 1,\n  \"quantity\": 1,\n  \"delivery_date_scheduled\": \"2026-07-10T12:00:00Z\"\n}" }
+          }
+        },
+        {
+          "name": "Step 2 — Confirm Payment (mock)",
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/shop/checkout/confirm",
+            "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }, { "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"product_id\": 1,\n  \"quantity\": 1,\n  \"delivery_date_scheduled\": \"2026-07-10T12:00:00Z\",\n  \"reference\": \"{{PAY_REF}}\"\n}" }
+          }
+        }
+      ]
+    },
+    {
+      "name": "10. Orders",
+      "item": [
+        { "name": "My Orders (as buyer)", "request": { "method": "GET", "url": "{{BASE_URL}}/orders/mine?role=buyer", "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }] } },
+        { "name": "My Orders (as vendor)", "request": { "method": "GET", "url": "{{BASE_URL}}/orders/mine?role=vendor", "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }] } },
+        {
+          "name": "Confirm Delivery (vendor scans QR)",
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/orders/1/deliver",
+            "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }, { "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{ \"delivery_code\": \"PASTE_CODE_FROM_ORDER_HERE\" }" }
+          }
+        }
+      ]
+    },
+    {
+      "name": "11. Cancel Order (3-step)",
+      "item": [
+        {
+          "name": "Step 1 — Buyer requests cancel",
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/orders/1/cancel/request",
+            "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }, { "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{ \"pin\": \"4421\" }" }
+          }
+        },
+        {
+          "name": "Step 2 — Vendor approves",
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/orders/1/cancel/vendor",
+            "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }]
+          }
+        },
+        {
+          "name": "Step 3 — Admin finalises (refund issued)",
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/orders/1/cancel/admin",
+            "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }]
+          }
+        }
+      ]
+    },
+    {
+      "name": "12. Wallet",
+      "item": [
+        { "name": "Get Balance", "request": { "method": "GET", "url": "{{BASE_URL}}/wallet", "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }] } },
+        { "name": "Transaction History", "request": { "method": "GET", "url": "{{BASE_URL}}/wallet/history", "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }] } }
+      ]
+    },
+    {
+      "name": "13. Messaging",
+      "item": [
+        {
+          "name": "Send Message",
+          "request": {
+            "method": "POST", "url": "{{BASE_URL}}/message/send",
+            "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }, { "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{ \"receiver_id\": 2, \"content\": \"Hi, is this available?\" }" }
+          }
+        },
+        { "name": "Get Conversations", "request": { "method": "GET", "url": "{{BASE_URL}}/conversations", "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }] } },
+        { "name": "Message History", "request": { "method": "GET", "url": "{{BASE_URL}}/messages/1", "header": [{ "key": "Authorization", "value": "Bearer {{TOKEN}}" }] } }
+      ]
+    },
+    {
+      "name": "14. Health",
+      "item": [
+        { "name": "Health Check", "request": { "method": "GET", "url": "{{BASE_URL}}/health" } }
+      ]
+    }
+  ]
+}

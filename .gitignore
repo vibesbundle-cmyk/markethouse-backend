@@ -1,0 +1,16 @@
+# Local env & secrets
+.env
+
+# Build artifacts
+server.exe
+server.exe~
+
+# Logs
+*.log
+*.err.log
+
+# Uploaded media (runtime data)
+uploads/
+
+# Go
+vendor/
