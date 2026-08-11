@@ -75,8 +75,15 @@ func main() {
 	log.Println("✓ Upload directories initialized")
 
 	// ---------------- STORAGE ----------------
-	storageClient := &storage.LocalStorage{
-		BaseURL: cfg.BaseURL,
+	// Use Cloudinary when the env keys are set (uploads survive redeploys).
+	// Otherwise fall back to local disk (dev convenience).
+	var storageClient storage.Storage
+	if cld, err := storage.NewCloudinaryStorage(); err == nil {
+		storageClient = cld
+		log.Println("✓ Using Cloudinary for uploads")
+	} else {
+		storageClient = &storage.LocalStorage{BaseURL: cfg.BaseURL}
+		log.Println("✓ Using local disk for uploads (set CLOUDINARY_* to switch)")
 	}
 
 	// ---------------- AUTH ----------------
