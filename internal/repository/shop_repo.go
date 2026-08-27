@@ -169,7 +169,7 @@ func (r *ShopRepo) AddToCart(userID, productID int64, qty int) error {
 func (r *ShopRepo) GetCart(userID int64) ([]models.CartItem, error) {
 	rows, err := r.DB.Query(`
 		SELECT ci.id, ci.user_id, ci.product_id, ci.quantity, ci.created_at,
-		       p.name, p.price, p.user_id
+		       p.name, p.price, p.user_id, COALESCE(p.images,'{}')
 		FROM cart_items ci
 		JOIN products p ON p.id = ci.product_id
 		WHERE ci.user_id=$1`, userID)
@@ -183,6 +183,7 @@ func (r *ShopRepo) GetCart(userID int64) ([]models.CartItem, error) {
 		if err := rows.Scan(
 			&it.ID, &it.UserID, &it.ProductID, &it.Quantity, &it.CreatedAt,
 			&it.ProductName, &it.ProductPrice, &it.VendorID,
+			pq.Array(&it.Images),
 		); err != nil {
 			return nil, err
 		}

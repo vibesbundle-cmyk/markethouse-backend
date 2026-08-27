@@ -31,9 +31,10 @@ type CartItem struct {
 	CreatedAt time.Time `json:"created_at"`
 
 	// Joined fields (populated in queries)
-	ProductName  string  `json:"product_name,omitempty"`
-	ProductPrice float64 `json:"product_price,omitempty"`
-	VendorID     int64   `json:"vendor_id,omitempty"`
+	ProductName  string   `json:"product_name,omitempty"`
+	ProductPrice float64  `json:"product_price,omitempty"`
+	VendorID     int64    `json:"vendor_id,omitempty"`
+	Images       []string `json:"images,omitempty"`
 }
 
 // ── ORDER ────────────────────────────────────────────────────────────────────

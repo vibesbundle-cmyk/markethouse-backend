@@ -46,7 +46,8 @@ func (h *CommerceHandler) List(c *gin.Context) {
 		       COALESCE(u.is_verified,false), COALESCE(u.username,''), COALESCE(u.profile_photo,''),
 		       l.upvotes, l.downvotes,
 		       COALESCE(uv.vote,0),
-		       l.latitude, l.longitude`
+		       l.latitude, l.longitude,
+		       EXISTS(SELECT 1 FROM cart_items ci WHERE ci.user_id=$1 AND ci.product_id=l.id) AS is_in_cart`
 	args := []interface{}{userID}
 	if hasLocation {
 		// Haversine distance in km — plain trig, no PostGIS/earthdistance
@@ -97,7 +98,7 @@ func (h *CommerceHandler) List(c *gin.Context) {
 		var price, discount float64
 		var stock sql.NullInt64 // NULL = unlimited ("always in stock")
 		var views, upvotes, downvotes, myVote int
-		var delivery bool
+		var delivery, isInCart bool
 		var images pq.StringArray
 		var metadataRaw string
 		var created string
@@ -107,7 +108,7 @@ func (h *CommerceHandler) List(c *gin.Context) {
 
 		scanArgs := []interface{}{&id, &uid, &title, &desc, &price, &discount, &category, &brand, &condition,
 			&stock, &sku, &delivery, &location, &images, &videoURL, &metadataRaw, &views, &created,
-			&isVerified, &username, &profilePhoto, &upvotes, &downvotes, &myVote, &lLat, &lLng}
+			&isVerified, &username, &profilePhoto, &upvotes, &downvotes, &myVote, &lLat, &lLng, &isInCart}
 		if hasLocation {
 			scanArgs = append(scanArgs, &distanceKm)
 		}
@@ -126,6 +127,7 @@ func (h *CommerceHandler) List(c *gin.Context) {
 			"metadata": metadata, "view_count": views, "created_at": created,
 			"is_verified": isVerified, "type": listingType,
 			"upvotes": upvotes, "downvotes": downvotes, "my_vote": myVote,
+			"is_in_cart": isInCart,
 		}
 		if stock.Valid {
 			row["stock"] = stock.Int64

@@ -137,6 +137,9 @@ func (s *MessageService) DeleteMessage(userID, msgID int64) error {
 func (s *MessageService) GetPinnedMessages(convID int64) ([]models.Message, error) {
 	return s.Repo.GetPinnedMessages(convID)
 }
+func (s *MessageService) GetStarredMessages(userID int64) ([]models.Message, error) {
+	return s.Repo.GetStarredMessages(userID)
+}
 func (s *MessageService) UpdateConversationSettings(convID int64, settings map[string]interface{}) error {
 	return s.Repo.UpdateConversationSettings(convID, settings)
 }

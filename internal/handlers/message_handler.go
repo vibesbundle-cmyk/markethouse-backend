@@ -131,6 +131,16 @@ func (h *MessageHandler) GetPinnedMessages(c *gin.Context) {
 	c.JSON(200, gin.H{"messages": msgs})
 }
 
+func (h *MessageHandler) GetStarredMessages(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	msgs, err := h.Service.GetStarredMessages(userID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"messages": msgs})
+}
+
 func (h *MessageHandler) GetConversation(c *gin.Context) {
 	userID := c.GetInt64("user_id")
 	convID, _ := strconv.ParseInt(c.Param("conv_id"), 10, 64)
