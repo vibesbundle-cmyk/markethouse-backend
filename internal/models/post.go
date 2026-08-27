@@ -19,5 +19,10 @@ type Post struct {
 	Price       float64         `json:"price,omitempty"`
 	IsLocked    bool            `json:"is_locked"`
 	TaggedUsers string          `json:"tagged_users,omitempty"` // comma-separated user IDs
+	Location    string          `json:"location,omitempty"`     // place name for the post
+	Latitude    *float64        `json:"latitude,omitempty"`
+	Longitude   *float64        `json:"longitude,omitempty"`
+	Audience    string          `json:"audience,omitempty"`             // public | followers | private
+	AudienceIDs string          `json:"audience_user_ids,omitempty"`    // comma-separated user IDs (private/custom)
 	CreatedAt   string          `json:"created_at"`
 }

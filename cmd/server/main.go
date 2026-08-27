@@ -93,7 +93,7 @@ func main() {
 		Redis:   redisClient,
 		Storage: storageClient,
 	}
-	authHandler := &handlers.AuthHandler{Service: authService}
+	authHandler := &handlers.AuthHandler{Service: authService, DB: db}
 
 	// ---------------- REAL-TIME HUB ----------------
 	hub := services.NewHub(redisClient)
@@ -104,7 +104,7 @@ func main() {
 	// ---------------- FOLLOW ----------------
 	followRepo := &repository.FollowRepo{DB: db}
 	followService := &services.FollowService{Repo: followRepo}
-	followHandler := &handlers.FollowHandler{Service: followService, Hub: hub}
+	followHandler := &handlers.FollowHandler{Service: followService, Hub: hub, DB: db}
 
 	// ---------------- POST ----------------
 	postRepo := &repository.PostRepo{DB: db}
@@ -113,18 +113,19 @@ func main() {
 		AuthRepo: authRepo,
 		Storage:  storageClient,
 	}
-	postHandler := &handlers.PostHandler{Service: postService, Hub: hub}
+	postHandler := &handlers.PostHandler{Service: postService, Hub: hub, DB: db}
 
 	// ---------------- INTERACTIONS ----------------
 	interactionRepo := &repository.InteractionRepo{DB: db}
 	interactionService := &services.InteractionService{Repo: interactionRepo}
-	interactionHandler := &handlers.InteractionHandler{Service: interactionService, Hub: hub}
+	interactionHandler := &handlers.InteractionHandler{Service: interactionService, Hub: hub, DB: db}
 
 	// ---------------- MESSAGING ----------------
 	messageRepo := &repository.MessageRepo{DB: db}
 	messageService := &services.MessageService{
-		Repo: messageRepo,
-		Hub:  hub,
+		Repo:    messageRepo,
+		Hub:     hub,
+		Storage: storageClient,
 	}
 	messageHandler := &handlers.MessageHandler{Service: messageService}
 
@@ -144,7 +145,7 @@ func main() {
 		Storage: storageClient,
 		Payment: paymentProvider,
 	}
-	shopHandler := &handlers.ShopHandler{Service: shopService}
+	shopHandler := &handlers.ShopHandler{Service: shopService, Hub: hub}
 
 	// ---------------- DELIVERY BREACH CRON ----------------
 	// Every 15 minutes: mark paid orders whose delivery_date_scheduled has
@@ -158,6 +159,17 @@ func main() {
 	}()
 	log.Println("✓ Delivery-breach cron scheduled (every 15m)")
 
+	// ---------------- SCHEDULED TRANSFERS CRON ----------------
+	// Every minute: execute pending scheduled transfers whose time has arrived.
+	go func() {
+		for range time.Tick(1 * time.Minute) {
+			if err := shopService.ProcessScheduledTransfers(); err != nil {
+				log.Printf("scheduled transfers cron: %v", err)
+			}
+		}
+	}()
+	log.Println("✓ Scheduled-transfer cron scheduled (every 1m)")
+
 	// ---------------- RECOMMENDATION ENGINE ----------------
 	recService := &services.RecommendationService{DB: db, Redis: redisClient}
 	signalHandler := &handlers.SignalHandler{DB: db, Redis: redisClient, Rec: recService}
@@ -166,13 +178,13 @@ func main() {
 	communityHandler := &handlers.CommunityHandler{DB: db, Hub: hub}
 
 	// ---------------- STATUS ----------------
-	statusHandler := &handlers.StatusHandler{DB: db}
+	statusHandler := &handlers.StatusHandler{DB: db, Hub: hub}
 
 	// ---------------- NOTIFICATIONS ----------------
 	notifHandler := &handlers.NotificationHandler{DB: db}
 
 	// ---------------- COMMERCE ----------------
-	commerceHandler := &handlers.CommerceHandler{DB: db, Storage: storageClient}
+	commerceHandler := &handlers.CommerceHandler{DB: db, Storage: storageClient, Hub: hub}
 
 	// ---------------- SUPPLY & DEMAND (thrift marketplace + escrow wallet) ----------------
 	supplyDemandHandler := &handlers.SupplyDemandHandler{DB: db, Hub: hub}

@@ -2,6 +2,8 @@ package repository
 
 import (
 	"database/sql"
+	"encoding/json"
+	"fmt"
 	"markethouse/internal/models"
 )
 
@@ -34,20 +36,79 @@ func (r *MessageRepo) CreateMessage(msg *models.Message) error {
 		msg.Latitude, msg.Longitude,
 	).Scan(&msg.ID, &msg.CreatedAt)
 	if err == nil {
-		snippet := msg.Content
-		if snippet == "" && msg.MessageType == "location" {
-			snippet = "📍 Location"
-		} else if snippet == "" && msg.MediaType != nil {
-			snippet = "[" + *msg.MediaType + "]"
-		}
+		snippet := r.snippetFor(msg)
 		r.DB.Exec(
 			"UPDATE conversations SET last_message=$1, updated_at=CURRENT_TIMESTAMP WHERE id=$2",
 			snippet, msg.ConversationID)
+		// A new message resurfaces the chat for anyone who hid/deleted it.
+		r.DB.Exec(`
+			UPDATE conversations SET
+				hidden_at_one = CASE WHEN user_one_id=$2 THEN NULL ELSE hidden_at_one END,
+				hidden_at_two = CASE WHEN user_two_id=$2 THEN NULL ELSE hidden_at_two END
+			WHERE id=$1`, msg.ConversationID, msg.SenderID)
 	}
 	return err
 }
 
-func (r *MessageRepo) GetMessages(convID int64, limit int) ([]models.Message, error) {
+// snippetFor builds the conversation-list preview line. Media messages get
+// friendly labels (plus a duration for voice/video when the client stored
+// one); structured payloads never leak raw JSON into the list.
+func (r *MessageRepo) snippetFor(msg *models.Message) string {
+	mt := msg.MessageType
+
+	var payload struct {
+		Name     string  `json:"name"`
+		Amount   float64 `json:"amount"`
+		Duration int     `json:"duration"`
+		Caption  string  `json:"caption"`
+	}
+	hasPayload := false
+	if msg.Content != "" && msg.Content[0] == '{' {
+		if err := json.Unmarshal([]byte(msg.Content), &payload); err == nil &&
+			(payload.Name != "" || payload.Amount > 0 || payload.Duration > 0) {
+			hasPayload = true
+		}
+	}
+
+	dur := ""
+	if payload.Duration > 0 {
+		dur = fmt.Sprintf(" · %d:%02d", payload.Duration/60, payload.Duration%60)
+	}
+
+	switch {
+	case mt == "location":
+		return "📍 Location"
+	case mt == "transfer":
+		if payload.Amount > 0 {
+			return fmt.Sprintf("💸 Sent ₦%.2f", payload.Amount)
+		}
+		return "💸 Money transfer"
+	case mt == "file" && hasPayload:
+		return "📄 " + payload.Name
+	case hasPayload && payload.Caption != "":
+		return payload.Caption
+	case mt == "audio" || mt == "voice" || *safeMediaType(msg) == "audio":
+		return "🎤 Voice message" + dur
+	case mt == "image" || *safeMediaType(msg) == "image":
+		return "📷 Photo"
+	case mt == "video" || *safeMediaType(msg) == "video":
+		return "🎬 Video" + dur
+	default:
+		return msg.Content
+	}
+}
+
+func safeMediaType(msg *models.Message) *string {
+	if msg.MediaType != nil {
+		return msg.MediaType
+	}
+	e := ""
+	return &e
+}
+
+func (r *MessageRepo) GetMessages(convID, userID int64, limit int) ([]models.Message, error) {
+	// Hide everything the calling user cleared out of the chat (their own
+	// per-side marker), while keeping the other side's view untouched.
 	rows, err := r.DB.Query(`
 		SELECT
 			m.id, m.sender_id, m.receiver_id, m.content, m.is_read, m.created_at,
@@ -57,9 +118,13 @@ func (r *MessageRepo) GetMessages(convID int64, limit int) ([]models.Message, er
 			m.reaction, COALESCE(m.is_edited,false), m.expires_at,
 			m.latitude, m.longitude
 		FROM messages m
+		JOIN conversations c ON c.id = m.conversation_id
 		WHERE m.conversation_id = $1
+		  AND m.created_at > COALESCE(
+		        CASE WHEN c.user_one_id = $2 THEN c.cleared_at_one ELSE c.cleared_at_two END,
+		        to_timestamp(0))
 		ORDER BY m.created_at ASC
-		LIMIT $2`, convID, limit)
+		LIMIT $3`, convID, userID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -155,6 +220,52 @@ func (r *MessageRepo) GetPinnedMessages(convID int64) ([]models.Message, error) 
 	return list, nil
 }
 
+// MarkMessagesRead flags every unread message the user received in this
+// conversation as read. Called when they load the chat history.
+func (r *MessageRepo) MarkMessagesRead(convID, userID int64) error {
+	_, err := r.DB.Exec(
+		`UPDATE messages SET is_read=true WHERE conversation_id=$1 AND receiver_id=$2 AND is_read=false`,
+		convID, userID)
+	return err
+}
+
+// ClearConversation marks "now" as the start of the calling user's view of
+// the chat. Their history and unread badge ignore older messages; the other
+// participant keeps seeing everything.
+func (r *MessageRepo) ClearConversation(convID, userID int64) error {
+	res, err := r.DB.Exec(`
+		UPDATE conversations SET
+			cleared_at_one = CASE WHEN user_one_id=$2 THEN NOW() ELSE cleared_at_one END,
+			cleared_at_two = CASE WHEN user_two_id=$2 THEN NOW() ELSE cleared_at_two END
+		WHERE id=$1 AND ($2 IN (user_one_id, user_two_id))`,
+		convID, userID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// HideConversation sets a per-user timestamp that hides the conversation
+// from the caller's chat list. The other participant is unaffected.
+func (r *MessageRepo) HideConversation(convID, userID int64) error {
+	res, err := r.DB.Exec(`
+		UPDATE conversations SET
+			hidden_at_one = CASE WHEN user_one_id=$2 THEN NOW() ELSE hidden_at_one END,
+			hidden_at_two = CASE WHEN user_two_id=$2 THEN NOW() ELSE hidden_at_two END
+		WHERE id=$1 AND ($2 IN (user_one_id, user_two_id))`,
+		convID, userID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (r *MessageRepo) UpdateConversationSettings(convID int64, settings map[string]interface{}) error {
 	for k, v := range settings {
 		r.DB.Exec(`UPDATE conversations SET `+k+`=$1 WHERE id=$2`, v, convID)
@@ -168,6 +279,7 @@ type EnrichedConversation struct {
 	OtherUserID         int64  `json:"other_user_id"`
 	OtherUserName       string `json:"other_user_name"`
 	OtherUserPhoto      string `json:"other_user_photo"`
+	OtherUserHeader     string `json:"other_user_header"`
 	LastMessage         string `json:"last_message"`
 	LastTime            string `json:"last_time"`
 	UnreadCount         int    `json:"unread_count"`
@@ -179,6 +291,7 @@ type EnrichedConversation struct {
 	WallpaperColor      string `json:"wallpaper_color"`
 	WallpaperDim        float64 `json:"wallpaper_dim"`
 	BubbleColor         string `json:"bubble_color"`
+	BubbleOpacity       float64 `json:"bubble_opacity"`
 	DisappearingSeconds int    `json:"disappearing_seconds"`
 	IsMuted             bool   `json:"is_muted"`
 }
@@ -190,9 +303,11 @@ func (r *MessageRepo) GetConversations(userID int64) ([]EnrichedConversation, er
 			CASE WHEN c.user_one_id=$1 THEN c.user_two_id ELSE c.user_one_id END AS other_user_id,
 			CASE WHEN c.user_one_id=$1 THEN u2.full_name   ELSE u1.full_name   END AS other_user_name,
 			CASE WHEN c.user_one_id=$1 THEN COALESCE(u2.profile_photo,'') ELSE COALESCE(u1.profile_photo,'') END AS other_user_photo,
+			CASE WHEN c.user_one_id=$1 THEN COALESCE(u2.header_photo,'') ELSE COALESCE(u1.header_photo,'') END AS other_user_header,
 			COALESCE(c.last_message,'')                     AS last_message,
 			COALESCE(to_char(c.updated_at,'HH24:MI'),'')   AS last_time,
-			(SELECT COUNT(*) FROM messages m WHERE m.conversation_id=c.id AND m.receiver_id=$1 AND m.is_read=false) AS unread_count,
+			(SELECT COUNT(*) FROM messages m WHERE m.conversation_id=c.id AND m.receiver_id=$1 AND m.is_read=false
+			   AND m.created_at > COALESCE(CASE WHEN c.user_one_id=$1 THEN c.cleared_at_one ELSE c.cleared_at_two END, to_timestamp(0))) AS unread_count,
 			COALESCE(c.is_pinned,false),
 			COALESCE(c.is_archived,false),
 			COALESCE(c.custom_category,''),
@@ -200,12 +315,17 @@ func (r *MessageRepo) GetConversations(userID int64) ([]EnrichedConversation, er
 			COALESCE(c.wallpaper_color,''),
 			COALESCE(c.wallpaper_dim,0.3),
 			COALESCE(c.bubble_color,''),
+			COALESCE(c.bubble_opacity,1),
 			COALESCE(c.disappearing_seconds,0),
 			COALESCE(c.is_muted,false)
 		FROM conversations c
 		JOIN users u1 ON u1.id=c.user_one_id
 		JOIN users u2 ON u2.id=c.user_two_id
-		WHERE c.user_one_id=$1 OR c.user_two_id=$1
+		WHERE (c.user_one_id=$1 OR c.user_two_id=$1)
+		  AND (
+			CASE WHEN c.user_one_id=$1 THEN c.hidden_at_one ELSE c.hidden_at_two END
+			IS NULL
+		  )
 		ORDER BY COALESCE(c.is_pinned,false) DESC, c.updated_at DESC NULLS LAST
 	`, userID)
 	if err != nil {
@@ -215,10 +335,10 @@ func (r *MessageRepo) GetConversations(userID int64) ([]EnrichedConversation, er
 	var list []EnrichedConversation
 	for rows.Next() {
 		var c EnrichedConversation
-		if err := rows.Scan(&c.ID,&c.OtherUserID,&c.OtherUserName,&c.OtherUserPhoto,
+		if err := rows.Scan(&c.ID,&c.OtherUserID,&c.OtherUserName,&c.OtherUserPhoto,&c.OtherUserHeader,
 			&c.LastMessage,&c.LastTime,&c.UnreadCount,
 			&c.IsPinned,&c.IsArchived,&c.CustomCategory,
-			&c.Wallpaper,&c.WallpaperColor,&c.WallpaperDim,&c.BubbleColor,
+			&c.Wallpaper,&c.WallpaperColor,&c.WallpaperDim,&c.BubbleColor,&c.BubbleOpacity,
 			&c.DisappearingSeconds,&c.IsMuted); err != nil {
 			return nil, err
 		}
@@ -233,9 +353,11 @@ const enrichedConversationColumns = `
 			CASE WHEN c.user_one_id=$1 THEN c.user_two_id ELSE c.user_one_id END AS other_user_id,
 			CASE WHEN c.user_one_id=$1 THEN u2.full_name   ELSE u1.full_name   END AS other_user_name,
 			CASE WHEN c.user_one_id=$1 THEN COALESCE(u2.profile_photo,'') ELSE COALESCE(u1.profile_photo,'') END AS other_user_photo,
+			CASE WHEN c.user_one_id=$1 THEN COALESCE(u2.header_photo,'') ELSE COALESCE(u1.header_photo,'') END AS other_user_header,
 			COALESCE(c.last_message,'')                     AS last_message,
 			COALESCE(to_char(c.updated_at,'HH24:MI'),'')   AS last_time,
-			(SELECT COUNT(*) FROM messages m WHERE m.conversation_id=c.id AND m.receiver_id=$1 AND m.is_read=false) AS unread_count,
+			(SELECT COUNT(*) FROM messages m WHERE m.conversation_id=c.id AND m.receiver_id=$1 AND m.is_read=false
+			   AND m.created_at > COALESCE(CASE WHEN c.user_one_id=$1 THEN c.cleared_at_one ELSE c.cleared_at_two END, to_timestamp(0))) AS unread_count,
 			COALESCE(c.is_pinned,false),
 			COALESCE(c.is_archived,false),
 			COALESCE(c.custom_category,''),
@@ -243,6 +365,7 @@ const enrichedConversationColumns = `
 			COALESCE(c.wallpaper_color,''),
 			COALESCE(c.wallpaper_dim,0.3),
 			COALESCE(c.bubble_color,''),
+			COALESCE(c.bubble_opacity,1),
 			COALESCE(c.disappearing_seconds,0),
 			COALESCE(c.is_muted,false)`
 
@@ -256,10 +379,53 @@ func (r *MessageRepo) GetConversation(convID, userID int64) (EnrichedConversatio
 		JOIN users u1 ON u1.id=c.user_one_id
 		JOIN users u2 ON u2.id=c.user_two_id
 		WHERE c.id=$2 AND (c.user_one_id=$1 OR c.user_two_id=$1)
-	`, userID, convID).Scan(&c.ID,&c.OtherUserID,&c.OtherUserName,&c.OtherUserPhoto,
+	`, userID, convID).Scan(&c.ID,&c.OtherUserID,&c.OtherUserName,&c.OtherUserPhoto,&c.OtherUserHeader,
 		&c.LastMessage,&c.LastTime,&c.UnreadCount,
 		&c.IsPinned,&c.IsArchived,&c.CustomCategory,
 		&c.Wallpaper,&c.WallpaperColor,&c.WallpaperDim,&c.BubbleColor,
 		&c.DisappearingSeconds,&c.IsMuted)
 	return c, err
+}
+
+// PurgeConversation wipes EVERY trace of a conversation for both people:
+// all message rows are deleted (their media URLs are returned so the caller
+// can remove the files), the preview resets, and the chat drops off both
+// chat lists until someone messages again — then it starts completely fresh.
+func (r *MessageRepo) PurgeConversation(convID, userID int64) ([]string, error) {
+	var member int64
+	if err := r.DB.QueryRow(`
+		SELECT COUNT(1) FROM conversations
+		WHERE id=$1 AND ($2 IN (user_one_id, user_two_id))`,
+		convID, userID).Scan(&member); err != nil {
+		return nil, err
+	}
+	if member == 0 {
+		return nil, sql.ErrNoRows
+	}
+	rows, err := r.DB.Query(
+		`SELECT COALESCE(media_url,'') FROM messages WHERE conversation_id=$1`, convID)
+	if err != nil {
+		return nil, err
+	}
+	var media []string
+	for rows.Next() {
+		var u string
+		if err := rows.Scan(&u); err == nil && u != "" {
+			media = append(media, u)
+		}
+	}
+	rows.Close()
+	if _, err := r.DB.Exec(`DELETE FROM messages WHERE conversation_id=$1`, convID); err != nil {
+		return media, err
+	}
+	_, err = r.DB.Exec(`
+		UPDATE conversations SET
+			last_message = '',
+			cleared_at_one = NULL,
+			cleared_at_two = NULL,
+			hidden_at_one = NOW(),
+			hidden_at_two = NOW(),
+			updated_at = CURRENT_TIMESTAMP
+		WHERE id=$1`, convID)
+	return media, err
 }

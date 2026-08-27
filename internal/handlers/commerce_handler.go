@@ -3,9 +3,11 @@ package handlers
 import (
 	"database/sql"
 	"encoding/json"
+	"markethouse/internal/services"
 	"markethouse/internal/storage"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/lib/pq"
@@ -14,11 +16,11 @@ import (
 type CommerceHandler struct {
 	DB      *sql.DB
 	Storage storage.Storage
+	Hub     *services.Hub
 }
 
 var validListingTypes = map[string]bool{
-	"product": true, "service": true, "job": true, "hotel": true,
-	"property": true, "vehicle": true, "event": true,
+	"product": true, "service": true, "job": true,
 }
 
 // GET /commerce?type=product — list all active listings of a given type.
@@ -38,10 +40,11 @@ func (h *CommerceHandler) List(c *gin.Context) {
 
 	query := `
 		SELECT l.id, l.user_id, l.title, COALESCE(l.description,''), l.price, COALESCE(l.discount_price,0),
-		       COALESCE(l.category,''), COALESCE(l.brand,''), COALESCE(l.condition,''), COALESCE(l.stock,0),
+		       COALESCE(l.category,''), COALESCE(l.brand,''), COALESCE(l.condition,''), l.stock,
 		       COALESCE(l.sku,''), l.delivery_available, COALESCE(l.location,''), COALESCE(l.images,'{}'),
 		       COALESCE(l.video_url,''), COALESCE(l.metadata::text,'{}'), l.views, l.created_at,
-		       COALESCE(u.is_verified,false), COALESCE(u.username,''), l.upvotes, l.downvotes,
+		       COALESCE(u.is_verified,false), COALESCE(u.username,''), COALESCE(u.profile_photo,''),
+		       l.upvotes, l.downvotes,
 		       COALESCE(uv.vote,0),
 		       l.latitude, l.longitude`
 	args := []interface{}{userID}
@@ -61,6 +64,12 @@ func (h *CommerceHandler) List(c *gin.Context) {
 		LEFT JOIN commerce_listing_votes uv ON uv.listing_id = l.id AND uv.user_id = $1
 		WHERE l.listing_type = $` + strconv.Itoa(len(args)+1) + ` AND l.status = 'active'`
 	args = append(args, listingType)
+	// Optional ?category=fashion — case-insensitive match on the listing's
+	// category field (powers the sort chips on the browse grid).
+	if cat := strings.TrimSpace(c.Query("category")); cat != "" {
+		args = append(args, cat)
+		query += ` AND l.category ILIKE '%'||$` + strconv.Itoa(len(args)) + `||'%'`
+	}
 	if hasLocation && radiusKm > 0 {
 		query += ` AND l.latitude IS NOT NULL AND l.longitude IS NOT NULL AND
 		  (6371 * acos(LEAST(1, GREATEST(-1,
@@ -84,9 +93,10 @@ func (h *CommerceHandler) List(c *gin.Context) {
 	results := []gin.H{}
 	for rows.Next() {
 		var id, uid int64
-		var title, desc, category, brand, condition, sku, location, videoURL, username string
+		var title, desc, category, brand, condition, sku, location, videoURL, username, profilePhoto string
 		var price, discount float64
-		var stock, views, upvotes, downvotes, myVote int
+		var stock sql.NullInt64 // NULL = unlimited ("always in stock")
+		var views, upvotes, downvotes, myVote int
 		var delivery bool
 		var images pq.StringArray
 		var metadataRaw string
@@ -97,7 +107,7 @@ func (h *CommerceHandler) List(c *gin.Context) {
 
 		scanArgs := []interface{}{&id, &uid, &title, &desc, &price, &discount, &category, &brand, &condition,
 			&stock, &sku, &delivery, &location, &images, &videoURL, &metadataRaw, &views, &created,
-			&isVerified, &username, &upvotes, &downvotes, &myVote, &lLat, &lLng}
+			&isVerified, &username, &profilePhoto, &upvotes, &downvotes, &myVote, &lLat, &lLng}
 		if hasLocation {
 			scanArgs = append(scanArgs, &distanceKm)
 		}
@@ -108,14 +118,18 @@ func (h *CommerceHandler) List(c *gin.Context) {
 		json.Unmarshal([]byte(metadataRaw), &metadata)
 
 		row := gin.H{
-			"id": id, "user_id": uid, "username": username, "title": title, "description": desc,
+			"id": id, "user_id": uid, "username": username, "profile_photo": profilePhoto,
+			"title": title, "description": desc,
 			"price": price, "discount_price": discount, "category": category, "brand": brand,
-			"condition": condition, "stock": stock, "sku": sku, "delivery_available": delivery,
+			"condition": condition, "sku": sku, "delivery_available": delivery,
 			"location": location, "images": []string(images), "video_url": videoURL,
 			"metadata": metadata, "view_count": views, "created_at": created,
 			"is_verified": isVerified, "type": listingType,
 			"upvotes": upvotes, "downvotes": downvotes, "my_vote": myVote,
 		}
+		if stock.Valid {
+			row["stock"] = stock.Int64
+		} // else stays nil — JSON null means unlimited
 		if distanceKm != nil {
 			row["distance_km"] = *distanceKm
 		}
@@ -135,7 +149,7 @@ func (h *CommerceHandler) GetMine(c *gin.Context) {
 	userID := c.GetInt64("user_id")
 	rows, err := h.DB.Query(`
 		SELECT l.id, l.listing_type, l.title, COALESCE(l.description,''), l.price, COALESCE(l.discount_price,0),
-		       COALESCE(l.category,''), COALESCE(l.brand,''), COALESCE(l.condition,''), COALESCE(l.stock,0),
+		       COALESCE(l.category,''), COALESCE(l.brand,''), COALESCE(l.condition,''), l.stock,
 		       COALESCE(l.sku,''), l.delivery_available, COALESCE(l.location,''), COALESCE(l.images,'{}'),
 		       COALESCE(l.video_url,''), COALESCE(l.metadata::text,'{}'), l.views, l.created_at, l.status
 		FROM commerce_listings l
@@ -152,7 +166,8 @@ func (h *CommerceHandler) GetMine(c *gin.Context) {
 		var id int64
 		var listingType, title, desc, category, brand, condition, sku, location, videoURL, status string
 		var price, discount float64
-		var stock, views int
+		var stock sql.NullInt64 // NULL = unlimited
+		var views int
 		var delivery bool
 		var images pq.StringArray
 		var metadataRaw, created string
@@ -164,13 +179,17 @@ func (h *CommerceHandler) GetMine(c *gin.Context) {
 		var metadata map[string]interface{}
 		json.Unmarshal([]byte(metadataRaw), &metadata)
 
-		results = append(results, gin.H{
+		row := gin.H{
 			"id": id, "type": listingType, "title": title, "description": desc,
 			"price": price, "discount_price": discount, "category": category, "brand": brand,
-			"condition": condition, "stock": stock, "sku": sku, "delivery_available": delivery,
+			"condition": condition, "sku": sku, "delivery_available": delivery,
 			"location": location, "images": []string(images), "video_url": videoURL,
 			"metadata": metadata, "view_count": views, "created_at": created, "status": status,
-		})
+		}
+		if stock.Valid {
+			row["stock"] = stock.Int64
+		} // else stays nil — JSON null means unlimited
+		results = append(results, row)
 	}
 	c.JSON(200, gin.H{"listings": results})
 }
@@ -193,8 +212,8 @@ func (h *CommerceHandler) Create(c *gin.Context) {
 	price, _ := strconv.ParseFloat(c.DefaultPostForm("price", "0"), 64)
 	discount, _ := strconv.ParseFloat(c.DefaultPostForm("discount_price", "0"), 64)
 	var stock interface{} // NULL = always in stock (matches the nullable `stock` column)
-	if v, err := strconv.Atoi(c.PostForm("stock")); err == nil {
-		stock = v
+	if v, err := strconv.Atoi(c.PostForm("stock")); err == nil && v > 0 {
+		stock = v // 0 or missing counts as unlimited, never "out of stock"
 	}
 	delivery, _ := strconv.ParseBool(c.DefaultPostForm("delivery_available", "false"))
 	metadata := c.DefaultPostForm("metadata", "{}")
@@ -235,6 +254,31 @@ func (h *CommerceHandler) Create(c *gin.Context) {
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
+	}
+	if h.Hub != nil {
+		var username, profilePhoto string
+		h.DB.QueryRow(`SELECT COALESCE(username,''), COALESCE(profile_photo,'') FROM users WHERE id=$1`, userID).Scan(&username, &profilePhoto)
+		listing := gin.H{
+			"id": id, "user_id": userID, "username": username, "profile_photo": profilePhoto,
+			"title": title, "description": c.PostForm("description"),
+			"price": price, "discount_price": discount, "category": c.PostForm("category"),
+			"brand": c.PostForm("brand"), "condition": c.PostForm("condition"),
+			"sku": c.PostForm("sku"), "delivery_available": delivery,
+			"location": c.PostForm("location"), "images": imageURLs, "video_url": c.PostForm("video_url"),
+			"metadata": map[string]interface{}{}, "view_count": 0, "created_at": time.Now().Format(time.RFC3339),
+			"is_verified": false, "type": listingType,
+			"upvotes": 0, "downvotes": 0, "my_vote": 0,
+		}
+		if stock != nil {
+			listing["stock"] = stock
+		}
+		h.Hub.Broadcast(map[string]interface{}{
+			"type":         "commerce_listing",
+			"listing_id":   id,
+			"user_id":      userID,
+			"listing_type": listingType,
+			"listing":      listing,
+		})
 	}
 	c.JSON(200, gin.H{"id": id})
 }

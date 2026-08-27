@@ -138,6 +138,8 @@ func (r *AuthRepo) FindByUsername(username string, viewerID int64) (models.User,
 	var headerPhoto sql.NullString
 	var bio sql.NullString
 	var bName, bCategory, bDesc, bPhone, bEmail, bWebsite, bAddress, bCountry, bState, bCity sql.NullString
+	var locationText sql.NullString
+	var latitude, longitude sql.NullFloat64
 
 	err := r.DB.QueryRow(`
 		SELECT id, full_name, username, email, mobile, password, profile_photo, header_photo, bio, account_type, rating, sales_score,
@@ -146,7 +148,8 @@ func (r *AuthRepo) FindByUsername(username string, viewerID int64) (models.User,
 		  (SELECT COUNT(*) FROM follows WHERE following_id = users.id) as followers,
 		  CASE WHEN $2 = 0 THEN false ELSE EXISTS(SELECT 1 FROM follows WHERE follower_id = $2 AND following_id = users.id) END as is_following,
 		  COALESCE(is_verified, false), COALESCE(is_phone_verified, false), COALESCE(reputation,0),
-		  COALESCE(lga,''), COALESCE(state,''),
+		  COALESCE(lga,''), COALESCE(state,''), COALESCE(location_text,''),
+		  COALESCE(latitude,0), COALESCE(longitude,0),
 		  business_name, business_category, business_desc, business_phone, business_email,
 		  business_website, business_address, business_country, business_state, business_city
 		FROM users
@@ -171,7 +174,8 @@ func (r *AuthRepo) FindByUsername(username string, viewerID int64) (models.User,
 		&user.IsVerified,
 		&user.IsPhoneVerified,
 		&user.Reputation,
-		&user.LGA, &user.State,
+		&user.LGA, &user.State, &locationText,
+		&latitude, &longitude,
 		&bName, &bCategory, &bDesc, &bPhone, &bEmail,
 		&bWebsite, &bAddress, &bCountry, &bState, &bCity,
 	)
@@ -181,6 +185,13 @@ func (r *AuthRepo) FindByUsername(username string, viewerID int64) (models.User,
 		user.ProfilePhoto = profilePhoto.String
 		user.HeaderPhoto = headerPhoto.String
 		user.Bio = bio.String
+		user.LocationText = locationText.String
+		if latitude.Valid {
+			user.Latitude = fmt.Sprintf("%f", latitude.Float64)
+		}
+		if longitude.Valid {
+			user.Longitude = fmt.Sprintf("%f", longitude.Float64)
+		}
 		user.BusinessName = bName.String
 		user.BusinessCategory = bCategory.String
 		user.BusinessDesc = bDesc.String
@@ -242,6 +253,19 @@ func (r *AuthRepo) UpdateProfilePhoto(userID int64, url string) error {
 	}
 	_, err := r.DB.Exec(`UPDATE users SET profile_photo=$1 WHERE id=$2`, photo, userID)
 	return err
+}
+
+// Status reshare credit: when true the user's name is hidden on other
+// people's reshares of their statuses (feed serves it as anonymous).
+func (r *AuthRepo) SetHideStatusCredit(userID int64, hide bool) error {
+	_, err := r.DB.Exec(`UPDATE users SET hide_status_credit=$1 WHERE id=$2`, hide, userID)
+	return err
+}
+
+func (r *AuthRepo) HideStatusCredit(userID int64) (bool, error) {
+	var hide bool
+	err := r.DB.QueryRow(`SELECT COALESCE(hide_status_credit,false) FROM users WHERE id=$1`, userID).Scan(&hide)
+	return hide, err
 }
 
 func (r *AuthRepo) UpdateHeaderPhoto(userID int64, url string) error {
@@ -307,6 +331,8 @@ func (r *AuthRepo) GetFullUserByID(id int64) (models.User, error) {
 	var headerPhoto sql.NullString
 	var bio sql.NullString
 	var bName, bCategory, bDesc, bPhone, bEmail, bWebsite, bAddress, bCountry, bState, bCity sql.NullString
+	var locationText sql.NullString
+	var latitude, longitude sql.NullFloat64
 
 	err := r.DB.QueryRow(`
 		SELECT id, full_name, username, email, mobile, profile_photo, header_photo, bio, account_type, rating, sales_score,
@@ -314,7 +340,8 @@ func (r *AuthRepo) GetFullUserByID(id int64) (models.User, error) {
 		  (SELECT COUNT(*) FROM follows WHERE follower_id = users.id) as following,
 		  (SELECT COUNT(*) FROM follows WHERE following_id = users.id) as followers,
 		  COALESCE(is_verified, false), COALESCE(reputation,0),
-		  COALESCE(lga,''), COALESCE(state,''),
+		  COALESCE(lga,''), COALESCE(state,''), COALESCE(location_text,''),
+		  COALESCE(latitude,0), COALESCE(longitude,0),
 		  business_name, business_category, business_desc, business_phone, business_email,
 		  business_website, business_address, business_country, business_state, business_city
 		FROM users
@@ -336,7 +363,8 @@ func (r *AuthRepo) GetFullUserByID(id int64) (models.User, error) {
 		&user.Followers,
 		&user.IsVerified,
 		&user.Reputation,
-		&user.LGA, &user.State,
+		&user.LGA, &user.State, &locationText,
+		&latitude, &longitude,
 		&bName, &bCategory, &bDesc, &bPhone, &bEmail,
 		&bWebsite, &bAddress, &bCountry, &bState, &bCity,
 	)
@@ -349,6 +377,13 @@ func (r *AuthRepo) GetFullUserByID(id int64) (models.User, error) {
 		user.ProfilePhoto = profilePhoto.String
 		user.HeaderPhoto = headerPhoto.String
 		user.Bio = bio.String
+		user.LocationText = locationText.String
+		if latitude.Valid {
+			user.Latitude = fmt.Sprintf("%f", latitude.Float64)
+		}
+		if longitude.Valid {
+			user.Longitude = fmt.Sprintf("%f", longitude.Float64)
+		}
 		user.BusinessName = bName.String
 		user.BusinessCategory = bCategory.String
 		user.BusinessDesc = bDesc.String
@@ -367,9 +402,9 @@ func (r *AuthRepo) GetFullUserByID(id int64) (models.User, error) {
 // UpdateLocation stores the user's last-known coordinates + LGA/state,
 // used for the "nearby" feed/marketplace and for showing a user's
 // approximate location to their chat contacts.
-func (r *AuthRepo) UpdateLocation(ctx context.Context, userID int64, lat, lng float64, lga, state string) error {
+func (r *AuthRepo) UpdateLocation(ctx context.Context, userID int64, lat, lng float64, lga, state, locationText string) error {
 	_, err := r.DB.ExecContext(ctx,
-		`UPDATE users SET latitude = $1, longitude = $2, lga = COALESCE(NULLIF($4,''), lga), state = COALESCE(NULLIF($5,''), state) WHERE id = $3`,
-		lat, lng, userID, lga, state)
+		`UPDATE users SET latitude = $1, longitude = $2, lga = COALESCE(NULLIF($4,''), lga), state = COALESCE(NULLIF($5,''), state), location_text = COALESCE(NULLIF($6,''), location_text) WHERE id = $3`,
+		lat, lng, userID, lga, state, locationText)
 	return err
 }

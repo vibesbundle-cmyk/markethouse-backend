@@ -102,6 +102,9 @@ type WalletTransaction struct {
 	Reference   string       `json:"reference"`
 	Description string       `json:"description"`
 	CreatedAt   time.Time    `json:"created_at"`
+	// Set on transfer legs — the other side of the payment.
+	CounterpartyID       *int64 `json:"counterparty_id,omitempty"`
+	CounterpartyUsername string `json:"counterparty_username,omitempty"`
 }
 
 // ── WALLET BALANCE (view) ────────────────────────────────────────────────────
@@ -109,4 +112,17 @@ type WalletBalance struct {
 	UserID        int64   `json:"user_id"`
 	AvailBalance  float64 `json:"available_balance"`
 	EscrowBalance float64 `json:"escrow_balance"` // locked in orders
+}
+
+// ── SCHEDULED TRANSFER ───────────────────────────────────────────────────────
+type ScheduledTransfer struct {
+	ID          int64     `json:"id"`
+	SenderID    int64     `json:"sender_id"`
+	ReceiverID  int64     `json:"receiver_id"`
+	Amount      float64   `json:"amount"`
+	Description string    `json:"description"`
+	ScheduledAt time.Time `json:"scheduled_at"`
+	Status      string    `json:"status"`
+	CreatedAt   time.Time `json:"created_at"`
+	ExecutedAt  *time.Time `json:"executed_at,omitempty"`
 }

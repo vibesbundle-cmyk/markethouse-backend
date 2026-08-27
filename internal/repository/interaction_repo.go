@@ -96,7 +96,7 @@ func (r *InteractionRepo) GetSavedPosts(userID int64) ([]map[string]interface{},
 	rows, err := r.DB.Query(`
 	SELECT
 		p.id, p.caption, p.media_url, p.media_type, p.post_type, p.price, p.is_locked,
-		p.tagged_users, p.created_at,
+		p.tagged_users, p.location, p.latitude, p.longitude, p.audience, p.audience_user_ids, p.created_at,
 		u.id, u.username, u.profile_photo,
 		(SELECT COUNT(*) FROM likes WHERE post_id = p.id) as like_count,
 		(SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comment_count,
@@ -105,7 +105,7 @@ func (r *InteractionRepo) GetSavedPosts(userID int64) ([]map[string]interface{},
 	FROM saves s
 	JOIN posts p ON p.id = s.post_id
 	JOIN users u ON p.user_id = u.id
-	WHERE s.user_id = $1
+	WHERE s.user_id = $1`+audienceFilter("$1")+`
 	ORDER BY s.created_at DESC
 	`, userID)
 	if err != nil {

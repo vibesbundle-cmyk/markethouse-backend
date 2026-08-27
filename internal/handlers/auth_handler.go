@@ -2,8 +2,10 @@ package handlers
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"log"
+	"math/rand"
 	"net/http"
 	"strconv"
 	"strings"
@@ -18,21 +20,42 @@ import (
 type AuthHandler struct {
 	Service *services.AuthService
 	Hub     *services.Hub
+	DB      *sql.DB
 }
 
 // ---------------- SIGNUP ----------------
 func (h *AuthHandler) Signup(c *gin.Context) {
 
-	var user models.User
-
-	if err := c.ShouldBindJSON(&user); err != nil {
+	// The body is read once and decoded twice: once into the User model,
+	// once as a raw map to pick up the optional "ref" referral code.
+	raw, err := c.GetRawData()
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+	var user models.User
+	if err := json.Unmarshal(raw, &user); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	var probe map[string]any
+	_ = json.Unmarshal(raw, &probe)
+	ref := ""
+	if s, ok := probe["ref"].(string); ok {
+		ref = strings.TrimSpace(s)
 	}
 
 	if err := h.Service.Signup(user); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+
+	// Link the invite now; the referrer gets their points only after the
+	// invitee verifies their email (see VerifyOTP).
+	if ref != "" && h.DB != nil {
+		h.DB.Exec(`UPDATE users SET referred_by=(SELECT id FROM users WHERE referral_code=$1)
+			WHERE email=$2 AND referred_by IS NULL`, strings.ToUpper(ref), strings.ToLower(user.Email))
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "user created"})
@@ -56,7 +79,74 @@ func (h *AuthHandler) VerifyOTP(c *gin.Context) {
 		return
 	}
 
+	h.rewardReferral(strings.ToLower(strings.TrimSpace(req.Email)))
+
 	c.JSON(http.StatusOK, gin.H{"message": "verified"})
+}
+
+// rewardReferral pays the referrer +25 reputation the first time an invited
+// user verifies. Runs best-effort — never blocks or fails the verification.
+func (h *AuthHandler) rewardReferral(email string) {
+	if h.DB == nil || email == "" {
+		return
+	}
+	var uid, refBy int64
+	var rewarded bool
+	err := h.DB.QueryRow(`SELECT id, COALESCE(referred_by,0), ref_rewarded
+		FROM users WHERE email=$1`, email).Scan(&uid, &refBy, &rewarded)
+	if err != nil || refBy == 0 || rewarded {
+		return
+	}
+	h.DB.Exec(`UPDATE users SET ref_rewarded=true WHERE id=$1`, uid)
+	if _, err := h.DB.Exec(`UPDATE users SET reputation=reputation+25 WHERE id=$1`, refBy); err != nil {
+		return
+	}
+	PushNotification(h.DB, refBy, uid, "referral",
+		"Invite bonus: +25 reputation", "A friend you invited just joined MarketHouse",
+		"user", refBy)
+	if h.Hub != nil {
+		h.Hub.SendToUser(refBy, gin.H{
+			"type": "notification", "notif_type": "referral",
+			"title": "Invite bonus: +25 reputation",
+			"body":  "A friend you invited just joined MarketHouse",
+		})
+	}
+}
+
+// GetReferral returns (generating on first use) the caller's invite code and
+// how many verified friends they've brought in.
+func (h *AuthHandler) GetReferral(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	var code sql.NullString
+	h.DB.QueryRow(`SELECT referral_code FROM users WHERE id=$1`, userID).Scan(&code)
+	if !code.Valid || code.String == "" {
+		for i := 0; i < 5; i++ {
+			gen := randomCode(8)
+			var clash int
+			h.DB.QueryRow(`SELECT COUNT(*) FROM users WHERE referral_code=$1`, gen).Scan(&clash)
+			if clash == 0 {
+				if _, err := h.DB.Exec(`UPDATE users SET referral_code=$1 WHERE id=$2 AND (referral_code IS NULL OR referral_code='')`,
+					gen, userID); err == nil {
+					code = sql.NullString{String: gen, Valid: true}
+					break
+				}
+			}
+		}
+	}
+	var invited int
+	h.DB.QueryRow(`SELECT COUNT(*) FROM users WHERE referred_by=$1 AND ref_rewarded=true`, userID).Scan(&invited)
+	c.JSON(200, gin.H{"code": code.String, "invited": invited, "bonus_per_invite": 25})
+}
+
+var codeRng = rand.New(rand.NewSource(time.Now().UnixNano()))
+
+func randomCode(n int) string {
+	const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = alphabet[codeRng.Intn(len(alphabet))]
+	}
+	return string(b)
 }
 
 // ---------------- LOGIN ----------------
@@ -201,6 +291,33 @@ func (h *AuthHandler) UpdateProfile(c *gin.Context) {
 
 	c.JSON(200, gin.H{"message": "profile updated"})
 }
+// ---------------- STATUS RESHARE CREDIT ----------------
+func (h *AuthHandler) GetHideStatusCredit(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	hide, err := h.Service.HideStatusCredit(userID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"hide": hide})
+}
+
+func (h *AuthHandler) SetHideStatusCredit(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	var req struct {
+		Hide bool `json:"hide"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.Service.SetHideStatusCredit(userID, req.Hide); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"ok": true})
+}
+
 func (h *AuthHandler) VerifyPhone(c *gin.Context) {
 
 	var req struct {
@@ -382,17 +499,18 @@ func (h *AuthHandler) UpdateLocation(c *gin.Context) {
 	userID := c.GetInt64("user_id")
 
 	var req struct {
-		Latitude  float64 `json:"latitude"`
-		Longitude float64 `json:"longitude"`
-		LGA       string  `json:"lga"`
-		State     string  `json:"state"`
+		Latitude     float64 `json:"latitude"`
+		Longitude    float64 `json:"longitude"`
+		LGA          string  `json:"lga"`
+		State        string  `json:"state"`
+		LocationText string  `json:"location_text"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
 
-	if err := h.Service.UpdateLocation(userID, req.Latitude, req.Longitude, req.LGA, req.State); err != nil {
+	if err := h.Service.UpdateLocation(userID, req.Latitude, req.Longitude, req.LGA, req.State, req.LocationText); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}

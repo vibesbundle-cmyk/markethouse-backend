@@ -61,8 +61,9 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 }
 
 func (h *MessageHandler) GetHistory(c *gin.Context) {
+	userID := c.GetInt64("user_id")
 	convID, _ := strconv.ParseInt(c.Param("conv_id"), 10, 64)
-	messages, err := h.Service.GetChatHistory(convID)
+	messages, err := h.Service.GetChatHistory(convID, userID)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -139,6 +140,38 @@ func (h *MessageHandler) GetConversation(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{"conversation": conv})
+}
+
+func (h *MessageHandler) ClearConversation(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	convID, _ := strconv.ParseInt(c.Param("conv_id"), 10, 64)
+	if err := h.Service.ClearChat(convID, userID); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"ok": true})
+}
+
+func (h *MessageHandler) HideConversation(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	convID, _ := strconv.ParseInt(c.Param("conv_id"), 10, 64)
+	if err := h.Service.HideChat(convID, userID); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"ok": true})
+}
+
+// PurgeConversation deletes the entire chat for both people — messages,
+// media files, everything. The next message starts the chat fresh.
+func (h *MessageHandler) PurgeConversation(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	convID, _ := strconv.ParseInt(c.Param("conv_id"), 10, 64)
+	if err := h.Service.PurgeChat(convID, userID); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"ok": true})
 }
 
 func (h *MessageHandler) UpdateConversationSettings(c *gin.Context) {

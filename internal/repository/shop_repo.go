@@ -46,6 +46,60 @@ func (r *ShopRepo) GetProductByID(id int64) (*models.Product, error) {
 	return p, nil
 }
 
+// EnsureProductForListing bridges the newer commerce_listings flow onto the
+// legacy products table that cart/checkout/orders key off. The first time a
+// listing is added to a cart it gets a mirror product row; the link is kept
+// in commerce_listings.product_id so later calls reuse it.
+func (r *ShopRepo) EnsureProductForListing(listingID int64) (*models.Product, error) {
+	var (
+		pid         sql.NullInt64
+		userID      int64
+		title       sql.NullString
+		description sql.NullString
+		category    sql.NullString
+		price       float64
+		discount    float64
+		stock       sql.NullInt64
+		images      pq.StringArray
+	)
+	err := r.DB.QueryRow(`
+		SELECT product_id, user_id, title, description, category, price,
+		       COALESCE(discount_price, 0), stock, images
+		FROM commerce_listings WHERE id=$1`, listingID).
+		Scan(&pid, &userID, &title, &description, &category, &price,
+			&discount, &stock, &images)
+	if err != nil {
+		return nil, fmt.Errorf("listing #%d not found", listingID)
+	}
+	if pid.Valid {
+		if p, perr := r.GetProductByID(pid.Int64); perr == nil {
+			return p, nil
+		}
+	}
+	effective := price
+	if discount > 0 && discount < price {
+		effective = discount
+	}
+	unlimited := !stock.Valid // NULL stock on a listing == always available
+	var stockCount int64
+	if stock.Valid {
+		stockCount = stock.Int64
+	}
+	var newPID int64
+	if err := r.DB.QueryRow(`
+		INSERT INTO products
+		  (user_id, name, description, category, price, stock_count, is_unlimited_stock, images, is_active)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true)
+		RETURNING id`,
+		userID, title.Value, description.Value, category.Value,
+		effective, stockCount, unlimited, images,
+	).Scan(&newPID); err != nil {
+		return nil, err
+	}
+	r.DB.Exec(`UPDATE commerce_listings SET product_id=$1 WHERE id=$2`, newPID, listingID)
+	return r.GetProductByID(newPID)
+}
+
 func (r *ShopRepo) GetProductsByVendor(vendorID int64) ([]models.Product, error) {
 	rows, err := r.DB.Query(`
 		SELECT id, user_id, name, description, category, price,
@@ -200,6 +254,34 @@ func (r *ShopRepo) GetOrdersByBuyer(buyerID int64) ([]models.Order, error) {
 	return r.queryOrders(`WHERE o.buyer_id=$1 ORDER BY o.created_at DESC`, buyerID)
 }
 
+// CreatePendingOrder — batch checkout: order sits as 'pending' until the
+// shared payment reference is confirmed.
+func (r *ShopRepo) CreatePendingOrder(o models.Order, reference string) (int64, string, error) {
+	code := generateDeliveryCode()
+	var id int64
+	err := r.DB.QueryRow(`
+		INSERT INTO orders
+		  (buyer_id, vendor_id, product_id, quantity, total_price, escrow_amount,
+		   status, delivery_date_scheduled, delivery_code, payment_reference)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		RETURNING id, delivery_code`,
+		o.BuyerID, o.VendorID, o.ProductID, o.Quantity,
+		o.TotalPrice, o.TotalPrice, models.OrderPending,
+		o.DeliveryDateScheduled, code, reference,
+	).Scan(&id, &code)
+	return id, code, err
+}
+
+func (r *ShopRepo) GetPendingOrdersByReference(buyerID int64, reference string) ([]models.Order, error) {
+	return r.queryOrders(`WHERE o.payment_reference=$1 AND o.buyer_id=$2 AND o.status='pending' ORDER BY o.id ASC`, reference, buyerID)
+}
+
+func (r *ShopRepo) MarkOrderPaid(orderID int64) error {
+	_, err := r.DB.Exec(
+		`UPDATE orders SET status=$1, updated_at=NOW() WHERE id=$2`, models.OrderPaid, orderID)
+	return err
+}
+
 func (r *ShopRepo) GetOrdersByVendor(vendorID int64) ([]models.Order, error) {
 	return r.queryOrders(`WHERE o.vendor_id=$1 ORDER BY o.created_at DESC`, vendorID)
 }
@@ -278,7 +360,7 @@ func (r *ShopRepo) RequestCancelOrder(orderID int64, hashedPin string) error {
 // VendorApproveCancelOrder — vendor signs off
 func (r *ShopRepo) VendorApproveCancelOrder(orderID int64) error {
 	_, err := r.DB.Exec(`
-		UPDATE orders SET vendor_cancel_approved=true, updated_at=NOW() WHERE id=$2`, orderID)
+		UPDATE orders SET vendor_cancel_approved=true, updated_at=NOW() WHERE id=$1`, orderID)
 	return err
 }
 
@@ -299,14 +381,18 @@ func (r *ShopRepo) GetOverdueOrders() ([]models.Order, error) {
 
 // ── WALLET ───────────────────────────────────────────────────────────────────
 
+// WalletBalanceSQL is the single source of truth for available balance —
+// the wallet_transactions ledger. Deposit/withdraw/send/scheduled all check
+// against this so the displayed balance can never drift from spendable.
+const WalletBalanceSQL = `
+		SELECT COALESCE(SUM(CASE WHEN type IN ('credit','escrow_out','refund') THEN amount
+		                          WHEN type IN ('debit','escrow_in','transfer','transfer_scheduled') THEN -amount
+		                          ELSE 0 END), 0)
+		FROM wallet_transactions WHERE user_id=$1`
+
 func (r *ShopRepo) GetWalletBalance(userID int64) (*models.WalletBalance, error) {
 	b := &models.WalletBalance{UserID: userID}
-	// available = sum of all credits - sum of all debits (excluding escrow in-flight)
-	r.DB.QueryRow(`
-		SELECT COALESCE(SUM(CASE WHEN type IN ('credit','escrow_out','refund') THEN amount
-		                          WHEN type IN ('debit','escrow_in') THEN -amount
-		                          ELSE 0 END), 0)
-		FROM wallet_transactions WHERE user_id=$1`, userID).Scan(&b.AvailBalance)
+	r.DB.QueryRow(WalletBalanceSQL, userID).Scan(&b.AvailBalance)
 	// escrow = money currently locked in paid orders as buyer
 	r.DB.QueryRow(`
 		SELECT COALESCE(SUM(escrow_amount),0) FROM orders
@@ -324,8 +410,12 @@ func (r *ShopRepo) AddWalletTransaction(tx models.WalletTransaction) error {
 
 func (r *ShopRepo) GetWalletHistory(userID int64) ([]models.WalletTransaction, error) {
 	rows, err := r.DB.Query(`
-		SELECT id, user_id, order_id, type, amount, reference, description, created_at
-		FROM wallet_transactions WHERE user_id=$1 ORDER BY created_at DESC`, userID)
+		SELECT wt.id, wt.user_id, wt.order_id, wt.type, wt.amount, wt.reference,
+		       wt.description, wt.created_at, wt.counterparty_id,
+		       COALESCE(u.username, '')
+		FROM wallet_transactions wt
+		LEFT JOIN users u ON u.id = wt.counterparty_id
+		WHERE wt.user_id=$1 ORDER BY wt.created_at DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -335,7 +425,8 @@ func (r *ShopRepo) GetWalletHistory(userID int64) ([]models.WalletTransaction, e
 		var t models.WalletTransaction
 		if err := rows.Scan(
 			&t.ID, &t.UserID, &t.OrderID, &t.Type, &t.Amount,
-			&t.Reference, &t.Description, &t.CreatedAt,
+			&t.Reference, &t.Description, &t.CreatedAt, &t.CounterpartyID,
+			&t.CounterpartyUsername,
 		); err != nil {
 			return nil, err
 		}
@@ -361,3 +452,71 @@ func generateTxRef() string {
 
 // Exported for service layer
 var GenerateTxRef = generateTxRef
+
+// ── SCHEDULED TRANSFERS ──────────────────────────────────────────────────────
+
+func (r *ShopRepo) CreateScheduledTransfer(senderID, receiverID int64, amount float64, desc string, scheduledAt time.Time) (int64, error) {
+	var id int64
+	err := r.DB.QueryRow(`
+		INSERT INTO scheduled_transfers(sender_id, receiver_id, amount, description, scheduled_at)
+		VALUES($1,$2,$3,$4,$5) RETURNING id`,
+		senderID, receiverID, amount, desc, scheduledAt).Scan(&id)
+	return id, err
+}
+
+func (r *ShopRepo) GetPendingScheduledTransfers() ([]models.ScheduledTransfer, error) {
+	rows, err := r.DB.Query(`
+		SELECT id, sender_id, receiver_id, amount, description, scheduled_at, status, created_at
+		FROM scheduled_transfers
+		WHERE status='pending' AND scheduled_at <= NOW()
+		ORDER BY scheduled_at ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var list []models.ScheduledTransfer
+	for rows.Next() {
+		var t models.ScheduledTransfer
+		if err := rows.Scan(&t.ID, &t.SenderID, &t.ReceiverID, &t.Amount,
+			&t.Description, &t.ScheduledAt, &t.Status, &t.CreatedAt); err != nil {
+			return nil, err
+		}
+		list = append(list, t)
+	}
+	return list, rows.Err()
+}
+
+func (r *ShopRepo) MarkScheduledTransferDone(id int64) error {
+	_, err := r.DB.Exec(`
+		UPDATE scheduled_transfers SET status='completed', executed_at=NOW() WHERE id=$1`, id)
+	return err
+}
+
+func (r *ShopRepo) CancelScheduledTransfer(id, senderID int64) error {
+	_, err := r.DB.Exec(`
+		UPDATE scheduled_transfers SET status='cancelled'
+		WHERE id=$1 AND sender_id=$2 AND status='pending'`, id, senderID)
+	return err
+}
+
+func (r *ShopRepo) GetScheduledTransfersBySender(senderID int64) ([]models.ScheduledTransfer, error) {
+	rows, err := r.DB.Query(`
+		SELECT id, sender_id, receiver_id, amount, description, scheduled_at, status, created_at
+		FROM scheduled_transfers
+		WHERE sender_id=$1 AND status IN ('pending','completed')
+		ORDER BY scheduled_at DESC`, senderID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var list []models.ScheduledTransfer
+	for rows.Next() {
+		var t models.ScheduledTransfer
+		if err := rows.Scan(&t.ID, &t.SenderID, &t.ReceiverID, &t.Amount,
+			&t.Description, &t.ScheduledAt, &t.Status, &t.CreatedAt); err != nil {
+			return nil, err
+		}
+		list = append(list, t)
+	}
+	return list, rows.Err()
+}

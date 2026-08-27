@@ -89,6 +89,8 @@ func SetupRouter(
 	auth.POST("/upload/header", authHandler.UploadImage)
 	auth.PUT("/user/update", authHandler.UpdateProfile)
 	auth.PUT("/user/location", authHandler.UpdateLocation)
+	auth.GET("/user/hide-status-credit", authHandler.GetHideStatusCredit)
+	auth.PUT("/user/hide-status-credit", authHandler.SetHideStatusCredit)
 	auth.GET("/profile", authHandler.Profile)
 	auth.GET("/user/:username", authHandler.GetPublicProfile)
 
@@ -105,12 +107,15 @@ func SetupRouter(
 	auth.PUT("/post/:post_id", postHandler.EditPost)
 	auth.DELETE("/post/:post_id", postHandler.DeletePost)
 	auth.GET("/posts/:user_id", postHandler.UserPosts)
+	auth.POST("/posts/:post_id/pin", postHandler.PinPost)
 	auth.GET("/post/:post_id", postHandler.PostDetail)
 	auth.GET("/posts/saved", interactionHandler.SavedPosts)
 	auth.GET("/posts/liked", postHandler.LikedPosts)
 	auth.GET("/posts/reshared", postHandler.ResharedPosts)
 	auth.GET("/posts/reshared/:user_id", postHandler.UserResharedPosts)
 	auth.GET("/feed/following", postHandler.FollowingFeed)
+	auth.GET("/hashtags/trending", postHandler.TrendingHashtags)
+	auth.GET("/hashtags/:tag/posts", postHandler.HashtagPosts)
 
 	// ── RECOMMENDATION ENGINE ──────────────────────────────────────────────
 	auth.POST("/signal", signalHandler.Record)
@@ -152,6 +157,8 @@ func SetupRouter(
 	auth.DELETE("/shop/cart/:item_id", shopHandler.RemoveFromCart)
 	auth.POST("/shop/checkout", shopHandler.Checkout)
 	auth.POST("/shop/checkout/confirm", shopHandler.ConfirmPayment)
+	auth.POST("/shop/checkout/batch", shopHandler.CheckoutBatch)
+	auth.POST("/shop/checkout/confirm-batch", shopHandler.ConfirmBatchPayment)
 	auth.GET("/orders/mine", shopHandler.MyOrders)
 	auth.POST("/orders/:id/deliver", shopHandler.ConfirmDelivery)
 	auth.POST("/orders/:id/cancel/request", shopHandler.RequestCancel)
@@ -164,6 +171,11 @@ func SetupRouter(
 	auth.POST("/wallet/deposit", shopHandler.Deposit)
 	auth.POST("/wallet/withdraw", shopHandler.Withdraw)
 	auth.POST("/wallet/send", shopHandler.Send)
+	auth.GET("/wallet/pin", shopHandler.PinStatus)
+	auth.POST("/wallet/pin", shopHandler.SetPin)
+	auth.POST("/wallet/schedule", shopHandler.ScheduleTransfer)
+	auth.DELETE("/wallet/schedule/:id", shopHandler.CancelSchedule)
+	auth.GET("/wallet/schedule", shopHandler.ListScheduled)
 
 	// ── GLOBAL SEARCH ──────────────────────────────────────────────
 	auth.GET("/search", func(c *gin.Context) {
@@ -238,6 +250,9 @@ func SetupRouter(
 	auth.PUT("/message/:msg_id", messageHandler.EditMessage)
 	auth.DELETE("/message/:msg_id", messageHandler.DeleteMessage)
 	auth.PUT("/conversation/:conv_id/settings", messageHandler.UpdateConversationSettings)
+	auth.POST("/conversation/:conv_id/clear", messageHandler.ClearConversation)
+ auth.POST("/conversation/:conv_id/hide", messageHandler.HideConversation)
+ auth.POST("/conversation/:conv_id/purge", messageHandler.PurgeConversation)
 
 	// ── REAL-TIME ─────────────────────────────────────────────────
 	// WebSocket needs custom auth handling for query param tokens
@@ -271,7 +286,14 @@ func SetupRouter(
 	// ---- Supply & Demand (thrift marketplace) ----
 	auth.GET("/supply-demand", supplyDemandHandler.GetListings)
 	auth.POST("/supply-demand", supplyDemandHandler.CreateListing)
+	auth.PUT("/supply-demand/:id", supplyDemandHandler.UpdateListing)
+	auth.DELETE("/supply-demand/:id", supplyDemandHandler.DeleteListing)
 	auth.POST("/supply-demand/:id/interest", supplyDemandHandler.ExpressInterest)
+	auth.GET("/supply-demand/mine", supplyDemandHandler.GetMyListings)
+	auth.POST("/supply-demand/ask-around", supplyDemandHandler.PostAskAround)
+	auth.GET("/supply-demand/nearby-suppliers", supplyDemandHandler.GetNearbySuppliers)
+	auth.GET("/supplier-preferences", supplyDemandHandler.GetSupplierPreferences)
+	auth.PUT("/supplier-preferences", supplyDemandHandler.SaveSupplierPreferences)
 	// ---- Admin (fee config — checkout/escrow/wallet integration is pending, see handler notes) ----
 	auth.GET("/admin/settings", supplyDemandHandler.GetSettings)
 	auth.PUT("/admin/settings", supplyDemandHandler.UpdateSettings)
@@ -290,6 +312,14 @@ func SetupRouter(
 	auth.POST("/community/:id/mute", communityHandler.MuteMember)
 	auth.GET("/community/:id/messages", communityHandler.GetMessages)
 	auth.POST("/community/:id/messages", communityHandler.SendMessage)
+	auth.PUT("/community/:id/messages/:mid", communityHandler.EditMessage)
+	auth.DELETE("/community/:id/messages/:mid", communityHandler.DeleteMessage)
+	auth.POST("/community/:id/messages/:mid/react", communityHandler.ReactMessage)
+	auth.GET("/community/:id/messages/:mid/reactions/:emoji", communityHandler.ReactionUsers)
+	auth.GET("/community/:id/online", communityHandler.Online)
+	auth.POST("/community/:id/title", communityHandler.SetTitle)
+	auth.POST("/community/:id/transfer", communityHandler.TransferOwnership)
+	auth.GET("/me/referral", authHandler.GetReferral)
 	auth.GET("/community/:id/can-call", communityHandler.CanCall)
 	// Community marketplace
 	auth.GET("/community/:id/listings", communityHandler.GetListings)
@@ -312,12 +342,17 @@ func SetupRouter(
 	auth.GET("/statuses", statusHandler.GetFeed)
 	auth.POST("/status", statusHandler.Create)
 	auth.POST("/status/:id/view", statusHandler.View)
+	auth.GET("/status/:id/views", statusHandler.Views)
 	auth.POST("/status/:id/react", statusHandler.React)
 	auth.DELETE("/status/:id", statusHandler.Delete)
 
 	// ── NOTIFICATIONS ─────────────────────────────────────────────
 	auth.GET("/notifications", notifHandler.GetAll)
+	auth.GET("/notifications/unread-count", notifHandler.UnreadCount)
 	auth.POST("/notifications/read", notifHandler.MarkRead)
+	auth.GET("/notifications/prefs", notifHandler.GetPrefs)
+	auth.PUT("/notifications/prefs", notifHandler.UpdatePrefs)
+	auth.POST("/device/register", notifHandler.RegisterDevice)
 
 	// ── CONTACT SYNCING ────────────────────────────────────────────
 	auth.POST("/contacts/sync", contactHandler.Sync)

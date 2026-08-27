@@ -337,8 +337,27 @@ func runSelfHealingMigrations(db *sql.DB) error {
 		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS wallpaper_color      TEXT DEFAULT ''`,
 		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS wallpaper_dim        REAL DEFAULT 0.3`,
 		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS bubble_color         TEXT DEFAULT ''`,
+		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS bubble_opacity       REAL DEFAULT 1`,
 		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS disappearing_seconds INTEGER DEFAULT 0`,
 		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS is_muted             BOOLEAN DEFAULT false`,
+		// per-user "clear chat" markers — history/unread counts hide everything
+		// older than the caller's own marker
+		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS cleared_at_one TIMESTAMPTZ`,
+		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS cleared_at_two TIMESTAMPTZ`,
+		// per-user "hide/delete chat" markers — hidden conversations are
+		// excluded from the conversation list for that user only
+		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS hidden_at_one TIMESTAMPTZ`,
+		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS hidden_at_two TIMESTAMPTZ`,
+		// status custom audience: CSV of user ids for privacy='custom'
+		`ALTER TABLE statuses ADD COLUMN IF NOT EXISTS custom_ids TEXT NOT NULL DEFAULT ''`,
+		// status reshare attribution: which status this was reshared from,
+		// plus a snapshot of the original author (survives original expiry).
+		`ALTER TABLE statuses ADD COLUMN IF NOT EXISTS reshared_from_id      INTEGER`,
+		`ALTER TABLE statuses ADD COLUMN IF NOT EXISTS reshared_from_user_id INTEGER`,
+		`ALTER TABLE statuses ADD COLUMN IF NOT EXISTS reshared_from_username TEXT NOT NULL DEFAULT ''`,
+		// user can hide their name on other people's reshares of their
+		// statuses — feed then serves the origin as anonymous (default on)
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS hide_status_credit BOOLEAN NOT NULL DEFAULT false`,
 
 		// communities created before "created_by"/"visibility" existed (old
 		// schema used "owner_id"/"type") — add the columns the handlers use
@@ -384,6 +403,7 @@ func runSelfHealingMigrations(db *sql.DB) error {
 		`ALTER TABLE posts ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'Other'`,
 		`ALTER TABLE posts ADD COLUMN IF NOT EXISTS quality_score NUMERIC(10,2) DEFAULT 0`,
 		`ALTER TABLE posts ADD COLUMN IF NOT EXISTS distribution_stage INTEGER DEFAULT 1`,
+		`ALTER TABLE posts ADD COLUMN IF NOT EXISTS views INTEGER NOT NULL DEFAULT 0`,
 		// posts: post_repo.go and interaction_repo.go SELECT/INSERT p.tagged_users,
 		// but no migration ever added the column — so any DB bootstrapped from
 		// vinci.sql alone (like the production Render DB) 500s on every feed and
@@ -623,10 +643,9 @@ func runNewFeatureMigrations(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_supplies_is_active ON supplies(is_active)`,
 		// Shop — products/cart/orders + the wallet ledger the escrow flow
 		// (Checkout/ConfirmDelivery/cancel+refund in shop_service.go) reads
-		// and writes via user_id (NOT the separate wallet_id-based table
-		// CreditWallet/DebitWallet/Transfer use for deposit/withdraw/send —
-		// those three still need reconciling onto this same table before
-		// they'll work; flagging rather than guessing which one to drop).
+		// and writes via user_id. Deposit/withdraw/send/Transfer were
+		// reconciled onto this same table (ledger-driven); the separate
+		// wallets table is legacy and no longer read or written.
 		`CREATE TABLE IF NOT EXISTS products (
 			id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 			name TEXT NOT NULL, description TEXT DEFAULT '', category TEXT DEFAULT '',
@@ -663,6 +682,42 @@ func runNewFeatureMigrations(db *sql.DB) error {
 		// Community group chat ("General Chat") — one shared room per community
 		`CREATE TABLE IF NOT EXISTS community_messages (id SERIAL PRIMARY KEY, community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, body TEXT, media_url TEXT, media_type TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`,
 		`CREATE INDEX IF NOT EXISTS idx_community_messages_comm ON community_messages(community_id, created_at)`,
+		`ALTER TABLE community_messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMP`,
+		`ALTER TABLE community_messages ADD COLUMN IF NOT EXISTS reply_to_id INTEGER REFERENCES community_messages(id) ON DELETE SET NULL`,
+		`ALTER TABLE communities ADD COLUMN IF NOT EXISTS slowmode_seconds INTEGER NOT NULL DEFAULT 0`,
+		// Message reactions (community chat) — one row per user per emoji
+		`CREATE TABLE IF NOT EXISTS community_message_reactions (
+			id SERIAL PRIMARY KEY,
+			message_id INTEGER NOT NULL REFERENCES community_messages(id) ON DELETE CASCADE,
+			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			emoji TEXT NOT NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE (message_id, user_id, emoji))`,
+		`CREATE INDEX IF NOT EXISTS idx_cmr_message ON community_message_reactions(message_id)`,
+		// Auto-mod rules — admin-configured, enforced server-side on send
+		`ALTER TABLE communities ADD COLUMN IF NOT EXISTS automod_block_links BOOLEAN NOT NULL DEFAULT FALSE`,
+		`ALTER TABLE communities ADD COLUMN IF NOT EXISTS automod_words TEXT NOT NULL DEFAULT ''`,
+		// Custom member title set by owner/admin (shows next to the username)
+		`ALTER TABLE community_members ADD COLUMN IF NOT EXISTS custom_title TEXT NOT NULL DEFAULT ''`,
+		// Referrals — code is generated lazily; reward lands when the invitee verifies
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by INTEGER REFERENCES users(id) ON DELETE SET NULL`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS ref_rewarded BOOLEAN NOT NULL DEFAULT FALSE`,
+		// Optional bcrypt hash — when set, /wallet/send requires it
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS transfer_pin_hash TEXT`,
+		// Backfill: pair legacy transfer legs (same note, amount, ±5min) so
+		// counterparty usernames resolve for transactions created before
+		// counterparty_id existed.
+		`UPDATE wallet_transactions r SET counterparty_id = s.user_id
+		 FROM wallet_transactions s
+		 WHERE r.type='credit' AND r.counterparty_id IS NULL
+		   AND r.description LIKE 'Received: %'
+		   AND s.type='transfer'
+		   AND regexp_replace(r.description, '^Received: ', '') = regexp_replace(s.description, '^Sent: ', '')
+		   AND r.amount = s.amount
+		   AND s.user_id <> r.user_id
+		   AND ABS(EXTRACT(EPOCH FROM (r.created_at - s.created_at))) < 300`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code ON users(referral_code) WHERE referral_code IS NOT NULL AND referral_code <> ''`,
 		// Community marketplace — buy/sell listings scoped to a single community
 		`CREATE TABLE IF NOT EXISTS community_listings (
 			id SERIAL PRIMARY KEY,
@@ -691,12 +746,18 @@ func runNewFeatureMigrations(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS supply_demand_listings (
 			id SERIAL PRIMARY KEY,
 			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-			kind TEXT NOT NULL, -- 'supply' | 'demand'
+			kind TEXT NOT NULL, -- 'supply' | 'demand' | 'ask_around'
 			title TEXT NOT NULL,
 			description TEXT,
 			price NUMERIC(14,2) DEFAULT 0,
+			min_price NUMERIC(14,2) DEFAULT 0,
+			max_price NUMERIC(14,2) DEFAULT 0,
+			negotiable BOOLEAN DEFAULT false,
 			category TEXT,
+			condition TEXT DEFAULT '',
+			quantity INTEGER DEFAULT 1,
 			images TEXT[] DEFAULT '{}',
+			location_text TEXT DEFAULT '',
 			location_lat DOUBLE PRECISION,
 			location_lng DOUBLE PRECISION,
 			radius_km INTEGER NOT NULL DEFAULT 5,
@@ -706,6 +767,24 @@ func runNewFeatureMigrations(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_sd_listings_kind ON supply_demand_listings(kind, status, created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_sd_listings_user_day ON supply_demand_listings(user_id, created_at)`,
+		// Self-heal columns added after initial schema
+		`ALTER TABLE supply_demand_listings ADD COLUMN IF NOT EXISTS location_text TEXT DEFAULT ''`,
+		`ALTER TABLE supply_demand_listings ADD COLUMN IF NOT EXISTS min_price NUMERIC(14,2) DEFAULT 0`,
+		`ALTER TABLE supply_demand_listings ADD COLUMN IF NOT EXISTS max_price NUMERIC(14,2) DEFAULT 0`,
+		`ALTER TABLE supply_demand_listings ADD COLUMN IF NOT EXISTS negotiable BOOLEAN DEFAULT false`,
+		`ALTER TABLE supply_demand_listings ADD COLUMN IF NOT EXISTS condition TEXT DEFAULT ''`,
+		`ALTER TABLE supply_demand_listings ADD COLUMN IF NOT EXISTS quantity INTEGER DEFAULT 1`,
+		// Supplier preferences — who wants to receive Ask Around notifications
+		`CREATE TABLE IF NOT EXISTS supplier_preferences (
+			id SERIAL PRIMARY KEY,
+			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			categories TEXT[] DEFAULT '{}',
+			supply_radius_km INTEGER NOT NULL DEFAULT 10,
+			is_active BOOLEAN DEFAULT true,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE (user_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_supplier_prefs_user ON supplier_preferences(user_id)`,
 		// Status
 		`CREATE TABLE IF NOT EXISTS statuses (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, status_type TEXT NOT NULL DEFAULT 'image', media_url TEXT, text_content TEXT, bg_color TEXT DEFAULT '#1DB954', text_color TEXT DEFAULT '#FFFFFF', font_style TEXT DEFAULT 'normal', privacy TEXT NOT NULL DEFAULT 'followers', view_count INTEGER DEFAULT 0, expires_at TIMESTAMP NOT NULL DEFAULT (CURRENT_TIMESTAMP + INTERVAL '24 hours'), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`,
 		`CREATE TABLE IF NOT EXISTS status_views (id SERIAL PRIMARY KEY, status_id INTEGER NOT NULL REFERENCES statuses(id) ON DELETE CASCADE, viewer_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, viewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE (status_id, viewer_id))`,
@@ -729,15 +808,29 @@ func runNewFeatureMigrations(db *sql.DB) error {
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`,
 		`CREATE INDEX IF NOT EXISTS idx_wallet_user_id ON wallet_transactions(user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_wallet_wallet_id ON wallet_transactions(wallet_id)`,
-		// Self-healing for DBs created before the unified wallet_transactions schema
-		`ALTER TABLE wallet_transactions ALTER COLUMN user_id DROP NOT NULL`,
-		`ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS wallet_id INTEGER`,
-		`ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS balance_after NUMERIC(15,2)`,
-		`ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'completed'`,
-		`ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS counterparty_id INTEGER`,
-		`ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS related_order_id INTEGER`,
 		// Notifications
 		`CREATE TABLE IF NOT EXISTS notifications (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, actor_id INTEGER REFERENCES users(id) ON DELETE SET NULL, type TEXT NOT NULL, title TEXT NOT NULL, body TEXT, ref_type TEXT, ref_id INTEGER, is_read BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`,
+		// Per-user notification preferences (toggles in Settings)
+		`CREATE TABLE IF NOT EXISTS notification_preferences (
+			user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+			master BOOLEAN NOT NULL DEFAULT true,
+			community_messages BOOLEAN NOT NULL DEFAULT true,
+			wallet BOOLEAN NOT NULL DEFAULT true,
+			likes BOOLEAN NOT NULL DEFAULT true,
+			comments BOOLEAN NOT NULL DEFAULT true,
+			reshares BOOLEAN NOT NULL DEFAULT true,
+			views BOOLEAN NOT NULL DEFAULT true
+		)`,
+		// Registered device push tokens (FCM / APNs) for real OS push.
+		`CREATE TABLE IF NOT EXISTS device_tokens (
+			id SERIAL PRIMARY KEY,
+			user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			token TEXT NOT NULL,
+			platform TEXT,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(user_id, token)
+		)`,
 		// Commerce
 		`CREATE TABLE IF NOT EXISTS commerce_products (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, category TEXT, brand TEXT, description TEXT, price NUMERIC(15,2) NOT NULL DEFAULT 0, discount_price NUMERIC(15,2), stock INTEGER DEFAULT 0, sku TEXT, condition TEXT DEFAULT 'new', delivery BOOLEAN DEFAULT true, images TEXT[], tags TEXT[], is_active BOOLEAN DEFAULT true, view_count INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`,
 		`CREATE TABLE IF NOT EXISTS commerce_services (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, category TEXT, price NUMERIC(15,2), description TEXT, duration TEXT, availability TEXT, location TEXT, images TEXT[], is_active BOOLEAN DEFAULT true, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`,
@@ -766,5 +859,52 @@ func runNewFeatureMigrations(db *sql.DB) error {
 			return err
 		}
 	}
+
+	// ── Wallet schema: always-run, error-tolerant pass ─────────────────
+	// These ALTERs MUST run even if earlier statements failed, because
+	// the wallet is core functionality. Failures are logged but never fatal.
+	for _, s := range []string{
+		`ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS wallet_id INTEGER`,
+		`ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS user_id INTEGER`,
+		`ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS balance_after NUMERIC(15,2)`,
+		`ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'completed'`,
+		`ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS counterparty_id INTEGER`,
+		`ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS related_order_id INTEGER`,
+		// Hashtags parsed from post captions (#word) — lowercase, deduped per post
+		`CREATE TABLE IF NOT EXISTS post_hashtags (
+			id SERIAL PRIMARY KEY,
+			post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+			tag TEXT NOT NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`,
+		`CREATE INDEX IF NOT EXISTS idx_post_hashtags_tag ON post_hashtags(lower(tag))`,
+		`CREATE INDEX IF NOT EXISTS idx_post_hashtags_post ON post_hashtags(post_id)`,
+		// Batch checkout — one payment can cover several cart orders
+		`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_reference TEXT`,
+		`CREATE INDEX IF NOT EXISTS idx_orders_payment_ref ON orders(payment_reference)`,
+		`ALTER TABLE wallet_transactions ALTER COLUMN user_id DROP NOT NULL`,
+		// Commerce listings mirror into the legacy products table for the
+		// cart/checkout flow — this link column records the mirror row.
+		`ALTER TABLE commerce_listings ADD COLUMN IF NOT EXISTS product_id BIGINT`,
+		// Profile post pinning (IG/TikTok style, max 3 per user)
+		`ALTER TABLE posts ADD COLUMN IF NOT EXISTS pinned_at TIMESTAMPTZ`,
+	} {
+		if _, err := db.Exec(s); err != nil {
+			log.Printf("warning: wallet self-heal skipped: %v — %.120s", err, s)
+		}
+	}
+
+	// Diagnostic: confirm wallet_id exists
+	var colExists bool
+	_ = db.QueryRow(`SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='wallet_transactions' AND column_name='wallet_id')`).Scan(&colExists)
+	log.Printf("[DIAG] wallet_transactions has wallet_id: %v", colExists)
+	if !colExists {
+		log.Printf("[DIAG] wallet_id STILL missing — forcing ALTER TABLE ADD COLUMN")
+		if _, err := db.Exec(`ALTER TABLE wallet_transactions ADD COLUMN wallet_id INTEGER`); err != nil {
+			log.Printf("[DIAG] FORCE ADD failed: %v", err)
+		} else {
+			log.Printf("[DIAG] FORCE ADD wallet_id succeeded")
+		}
+	}
+
 	return nil
 }

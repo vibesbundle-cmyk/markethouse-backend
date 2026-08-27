@@ -3,11 +3,13 @@ package services
 import (
 	"markethouse/internal/models"
 	"markethouse/internal/repository"
+	"markethouse/internal/storage"
 )
 
 type MessageService struct {
-	Repo *repository.MessageRepo
-	Hub  *Hub
+	Repo    *repository.MessageRepo
+	Hub     *Hub
+	Storage storage.Storage
 }
 
 func (s *MessageService) SendMessage(senderID, receiverID int64, msg models.Message) (models.Message, error) {
@@ -38,8 +40,59 @@ func (s *MessageService) SendMessage(senderID, receiverID int64, msg models.Mess
 	return msg, nil
 }
 
-func (s *MessageService) GetChatHistory(convID int64) ([]models.Message, error) {
-	return s.Repo.GetMessages(convID, 200)
+// GetChatHistory returns the conversation history. When the calling user is
+// the receiver of pending messages, those are marked as read first — this is
+// the "chat opened" moment that clears unread badges and read receipts.
+func (s *MessageService) GetChatHistory(convID, userID int64) ([]models.Message, error) {
+	if err := s.Repo.MarkMessagesRead(convID, userID); err != nil {
+		return nil, err
+	}
+	// Let the other person know their messages were just read so their
+	// open chat window can flip the ticks without a manual refresh.
+	if s.Hub != nil {
+		if conv, err := s.Repo.GetConversation(convID, userID); err == nil {
+			s.Hub.SendToUser(conv.OtherUserID, map[string]interface{}{
+				"type":            "messages_read",
+				"conversation_id": convID,
+				"reader_id":       userID,
+			})
+		}
+	}
+	return s.Repo.GetMessages(convID, userID, 200)
+}
+
+// ClearChat wipes the calling user's own view of a conversation. Messages
+// stay intact for the other participant.
+func (s *MessageService) ClearChat(convID, userID int64) error {
+	return s.Repo.ClearConversation(convID, userID)
+}
+
+// HideChat hides a conversation from the caller's chat list.
+func (s *MessageService) HideChat(convID, userID int64) error {
+	return s.Repo.HideConversation(convID, userID)
+}
+
+// PurgeChat deletes the whole conversation for BOTH people — every message
+// row and its media files. The chat disappears from both lists until one of
+// them messages again, at which point it starts fresh.
+func (s *MessageService) PurgeChat(convID, userID int64) error {
+	media, err := s.Repo.PurgeConversation(convID, userID)
+	for _, u := range media {
+		if s.Storage != nil {
+			s.Storage.Delete(u) // best effort
+		}
+	}
+	if s.Hub != nil {
+		if conv, cerr := s.Repo.GetConversation(convID, userID); cerr == nil {
+			payload := map[string]interface{}{
+				"type":            "conversation_purged",
+				"conversation_id": convID,
+			}
+			s.Hub.SendToUser(conv.OtherUserID, payload)
+			s.Hub.SendToUser(userID, payload)
+		}
+	}
+	return err
 }
 
 func (s *MessageService) GetUserChats(userID int64) ([]repository.EnrichedConversation, error) {

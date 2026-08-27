@@ -53,6 +53,7 @@ type UserResponse struct {
 	AccountType  string `json:"account_type"`
 	IsVerified   bool   `json:"is_verified"`
 	Reputation   int    `json:"reputation"`
+	SalesScore   int    `json:"sales_score"`
 	Badges       []string `json:"badges"`
 
 	// Business profile details — populated when AccountType == "business"
@@ -66,6 +67,11 @@ type UserResponse struct {
 	BusinessCountry  string `json:"business_country,omitempty"`
 	BusinessState    string `json:"business_state,omitempty"`
 	BusinessCity     string `json:"business_city,omitempty"`
+
+	// Location
+	LocationText string  `json:"location_text,omitempty"`
+	Latitude     float64 `json:"latitude,omitempty"`
+	Longitude    float64 `json:"longitude,omitempty"`
 }
 
 type LoginResponse struct {
@@ -410,6 +416,11 @@ func (s *AuthService) ResendPhoneOTP(mobile string) error {
 }
 
 // ---------------- GET PROFILE ----------------
+func parseFloat(s string) float64 {
+	f, _ := strconv.ParseFloat(s, 64)
+	return f
+}
+
 // computeBadges derives achievement badges from reputation. Kept simple and
 // stateless (no separate awards table) — thresholds can be tuned freely.
 func computeBadges(reputation int) []string {
@@ -447,6 +458,7 @@ func (s *AuthService) GetProfile(userID int64) (UserResponse, error) {
 		AccountType:      user.AccountType,
 		IsVerified:       user.IsVerified,
 		Reputation:       user.Reputation,
+		SalesScore:       user.SalesScore,
 		Badges:           computeBadges(user.Reputation),
 		BusinessName:     user.BusinessName,
 		BusinessCategory: user.BusinessCategory,
@@ -458,6 +470,9 @@ func (s *AuthService) GetProfile(userID int64) (UserResponse, error) {
 		BusinessCountry:  user.BusinessCountry,
 		BusinessState:    user.BusinessState,
 		BusinessCity:     user.BusinessCity,
+		LocationText:     user.LocationText,
+		Latitude:         parseFloat(user.Latitude),
+		Longitude:        parseFloat(user.Longitude),
 	}, nil
 }
 
@@ -482,6 +497,7 @@ func (s *AuthService) GetUserByUsername(username string, viewerID int64) (UserRe
 		AccountType:      user.AccountType,
 		IsVerified:       user.IsVerified,
 		Reputation:       user.Reputation,
+		SalesScore:       user.SalesScore,
 		Badges:           computeBadges(user.Reputation),
 		BusinessName:     user.BusinessName,
 		BusinessCategory: user.BusinessCategory,
@@ -493,6 +509,9 @@ func (s *AuthService) GetUserByUsername(username string, viewerID int64) (UserRe
 		BusinessCountry:  user.BusinessCountry,
 		BusinessState:    user.BusinessState,
 		BusinessCity:     user.BusinessCity,
+		LocationText:     user.LocationText,
+		Latitude:         parseFloat(user.Latitude),
+		Longitude:        parseFloat(user.Longitude),
 	}, nil
 }
 
@@ -509,6 +528,15 @@ func (s *AuthService) CheckUsername(username string) (bool, error) {
 
 func (s *AuthService) UsernameExists(username string) bool {
 	return s.Repo.UsernameExists(username)
+}
+
+// ---------------- STATUS RESHARE CREDIT ----------------
+func (s *AuthService) SetHideStatusCredit(userID int64, hide bool) error {
+	return s.Repo.SetHideStatusCredit(userID, hide)
+}
+
+func (s *AuthService) HideStatusCredit(userID int64) (bool, error) {
+	return s.Repo.HideStatusCredit(userID)
 }
 
 // ---------------- UPDATE PROFILE ----------------
@@ -623,9 +651,9 @@ func generateOTP() string {
 // UpdateLocation saves the caller's current coordinates plus their
 // approximate LGA/state. Coordinates are validated to be within legal
 // lat/lng ranges before hitting the DB.
-func (s *AuthService) UpdateLocation(userID int64, lat, lng float64, lga, state string) error {
+func (s *AuthService) UpdateLocation(userID int64, lat, lng float64, lga, state, locationText string) error {
 	if lat < -90 || lat > 90 || lng < -180 || lng > 180 {
 		return fmt.Errorf("invalid coordinates")
 	}
-	return s.Repo.UpdateLocation(bgCtx, userID, lat, lng, lga, state)
+	return s.Repo.UpdateLocation(bgCtx, userID, lat, lng, lga, state, locationText)
 }

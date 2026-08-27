@@ -3,6 +3,7 @@ package handlers
 import (
 	"database/sql"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -91,15 +92,20 @@ func (h *CommunityHandler) GetByID(c *gin.Context) {
 	var name, desc, rules, cover, icon, vis, cat, tags, createdAt, username string
 	var isMember, marketplace bool
 	var myRole sql.NullString
+	var slowmode int
+	var blockLinks bool
+	var automodWords string
 	err := h.DB.QueryRow(`
 		SELECT c.id, c.name, COALESCE(c.description,''), COALESCE(c.rules,''),
 		       COALESCE(c.cover_photo,''), COALESCE(c.icon,''), c.member_count,
 		       COALESCE(c.visibility,'public'), COALESCE(c.category,''),
 		       COALESCE(array_to_string(c.tags,','),''), c.created_at, COALESCE(c.username,''), COALESCE(c.marketplace_enabled,false),
 		       EXISTS(SELECT 1 FROM community_members cm WHERE cm.community_id=c.id AND cm.user_id=$2 AND cm.status='active'),
-		       (SELECT cm.role FROM community_members cm WHERE cm.community_id=c.id AND cm.user_id=$2 AND cm.status='active')
+		       (SELECT cm.role FROM community_members cm WHERE cm.community_id=c.id AND cm.user_id=$2 AND cm.status='active'),
+		       COALESCE(c.slowmode_seconds,0), COALESCE(c.automod_block_links,false), COALESCE(c.automod_words,'')
 		FROM communities c WHERE c.id=$1`, commID, userID).Scan(
-		&id, &name, &desc, &rules, &cover, &icon, &mc, &vis, &cat, &tags, &createdAt, &username, &marketplace, &isMember, &myRole)
+		&id, &name, &desc, &rules, &cover, &icon, &mc, &vis, &cat, &tags, &createdAt, &username, &marketplace,
+		&isMember, &myRole, &slowmode, &blockLinks, &automodWords)
 	if err != nil {
 		c.JSON(404, gin.H{"error": "not found"})
 		return
@@ -143,13 +149,59 @@ func (h *CommunityHandler) GetByID(c *gin.Context) {
 		}
 	}
 
+	// Top contributors — the About tab's mini leaderboard.
+	topMembers := []gin.H{}
+	if rows, err := h.DB.Query(`
+		SELECT u.id, u.username, COALESCE(u.profile_photo,''), COALESCE(u.reputation,0),
+		       COALESCE(cm.custom_title,'')
+		FROM community_members cm JOIN users u ON u.id=cm.user_id
+		WHERE cm.community_id=$1 AND cm.status='active'
+		ORDER BY COALESCE(u.reputation,0) DESC LIMIT 5`, commID); err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var uid, rep int64
+			var uname, photo, title string
+			if rows.Scan(&uid, &uname, &photo, &rep, &title) == nil {
+				topMembers = append(topMembers, gin.H{
+					"user_id": uid, "username": uname, "profile_photo": photo,
+					"reputation":     rep,
+					"custom_title":   title,
+					"title":          repTitle(rep, title),
+					"verified":       rep >= verifiedRepThreshold,
+				})
+			}
+		}
+	}
+
 	c.JSON(200, gin.H{"community": gin.H{
 		"id": id, "name": name, "description": desc, "rules": rules,
 		"cover_photo": cover, "icon": icon, "member_count": mc, "visibility": vis,
 		"category": cat, "tags": strings.Split(tags, ","), "is_member": isMember,
 		"created_at": createdAt, "owner": owner, "admins": admins, "moderators": mods,
 		"username": username, "marketplace_enabled": marketplace, "my_role": myRole.String,
+		"slowmode_seconds":    slowmode,
+		"automod_block_links": blockLinks,
+		"automod_words":       automodWords,
+		"top_members":         topMembers,
 	}})
+}
+
+// repTitle — the automatic reputation label: custom title if the admins set
+// one, otherwise the badge tier the member's points have earned.
+func repTitle(rep int64, custom string) string {
+	if custom != "" {
+		return custom
+	}
+	switch {
+	case rep >= 1000:
+		return "Top Contributor"
+	case rep >= 500:
+		return "Community Expert"
+	case rep >= 50:
+		return "Active Member"
+	default:
+		return ""
+	}
 }
 
 // ── Create community ─────────────────────────────────────────────────────────
@@ -446,6 +498,7 @@ func (h *CommunityHandler) CreatePost(c *gin.Context) {
 	}
 
 	h.DB.Exec(`UPDATE communities SET post_count=post_count+1 WHERE id=$1`, commID)
+
 	c.JSON(200, gin.H{"id": id})
 }
 
@@ -746,7 +799,7 @@ func (h *CommunityHandler) GetMembers(c *gin.Context) {
 	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
 	rows, err := h.DB.Query(`
 		SELECT u.id, u.username, COALESCE(u.profile_photo,''), cm.role, cm.status,
-		       COALESCE(u.reputation,0), cm.joined_at
+		       COALESCE(u.reputation,0), cm.joined_at, COALESCE(cm.custom_title,'')
 		FROM community_members cm
 		JOIN users u ON u.id = cm.user_id
 		WHERE cm.community_id=$1 AND cm.status IN ('active','muted')
@@ -759,14 +812,17 @@ func (h *CommunityHandler) GetMembers(c *gin.Context) {
 	var members []gin.H
 	for rows.Next() {
 		var uid, rep int64
-		var uname, photo, role, status, joinedAt string
-		if rows.Scan(&uid, &uname, &photo, &role, &status, &rep, &joinedAt) != nil {
+		var uname, photo, role, status, joinedAt, customTitle string
+		if rows.Scan(&uid, &uname, &photo, &role, &status, &rep, &joinedAt, &customTitle) != nil {
 			continue
 		}
 		members = append(members, gin.H{
 			"user_id": uid, "username": uname, "profile_photo": photo,
 			"role": role, "status": status, "reputation": rep, "joined_at": joinedAt,
-			"badges": computeBadgesForHandler(rep),
+			"badges":        computeBadgesForHandler(rep),
+			"custom_title":  customTitle,
+			"title":         repTitle(rep, customTitle),
+			"verified":      rep >= verifiedRepThreshold,
 		})
 	}
 	if members == nil {
@@ -871,6 +927,92 @@ func (h *CommunityHandler) MuteMember(c *gin.Context) {
 	c.JSON(200, gin.H{"ok": true})
 }
 
+// ── Set custom title (owner/admin only) ──────────────────────────────────────
+// A short label shown next to the member's name, e.g. "Vendor", "DJ".
+// Empty string clears it. Reputation TITLES are separate — those come
+// automatically from points and can't be overridden here.
+func (h *CommunityHandler) SetTitle(c *gin.Context) {
+	callerID := c.GetInt64("user_id")
+	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	if !canManageRoles(h.getMemberRole(commID, callerID)) {
+		c.JSON(403, gin.H{"error": "only the owner or an admin can set titles"})
+		return
+	}
+	var req struct {
+		UserID int64  `json:"user_id"`
+		Title  string `json:"title"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	title := strings.TrimSpace(req.Title)
+	if len([]rune(title)) > 24 {
+		c.JSON(400, gin.H{"error": "title is too long (max 24 characters)"})
+		return
+	}
+	res, err := h.DB.Exec(`UPDATE community_members SET custom_title=$1
+		WHERE community_id=$2 AND user_id=$3`, title, commID, req.UserID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		c.JSON(404, gin.H{"error": "member not found"})
+		return
+	}
+	c.JSON(200, gin.H{"ok": true, "title": title})
+}
+
+// ── Transfer ownership (owner only) ──────────────────────────────────────────
+// The new owner becomes 'owner'; the old owner steps down to admin — so an
+// owner always keeps full powers even after handing the community over.
+func (h *CommunityHandler) TransferOwnership(c *gin.Context) {
+	callerID := c.GetInt64("user_id")
+	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	if h.getMemberRole(commID, callerID) != "owner" {
+		c.JSON(403, gin.H{"error": "only the owner can transfer ownership"})
+		return
+	}
+	var req struct {
+		UserID int64 `json:"user_id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.UserID <= 0 {
+		c.JSON(400, gin.H{"error": "user_id required"})
+		return
+	}
+	if req.UserID == callerID {
+		c.JSON(400, gin.H{"error": "you already own this community"})
+		return
+	}
+	newRole := h.getMemberRole(commID, req.UserID)
+	if newRole == "" || newRole == "owner" {
+		c.JSON(400, gin.H{"error": "that user must be an active member first"})
+		return
+	}
+	tx, err := h.DB.Begin()
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE community_members SET role='owner'
+		WHERE community_id=$1 AND user_id=$2`, commID, req.UserID); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	if _, err := tx.Exec(`UPDATE community_members SET role='admin'
+		WHERE community_id=$1 AND user_id=$2`, commID, callerID); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"ok": true})
+}
+
 // ── Update community settings ────────────────────────────────────────────────
 func (h *CommunityHandler) UpdateSettings(c *gin.Context) {
 	callerID := c.GetInt64("user_id")
@@ -888,23 +1030,65 @@ func (h *CommunityHandler) UpdateSettings(c *gin.Context) {
 		Tags        []string `json:"tags"`
 		Icon        string   `json:"icon"`        // uploaded separately via /upload/media?type=community
 		CoverPhoto  string   `json:"cover_photo"` // same
+
+		// Pointer so "absent" (nil) means "leave unchanged" — 0 is a valid
+		// value meaning slow mode off.
+		SlowmodeSeconds *int `json:"slowmode_seconds"`
+
+		// Auto-mod rules. nil = unchanged; words is a comma-separated list.
+		AutomodBlockLinks *bool   `json:"automod_block_links"`
+		AutomodWords      *string `json:"automod_words"`
 	}
 	c.ShouldBindJSON(&req)
 	var tagsArray string
 	if len(req.Tags) > 0 {
 		tagsArray = "{" + strings.Join(req.Tags, ",") + "}"
-	} else {
-		tagsArray = "{}"
+	} // else stays "" → CASE below keeps the current tags
+
+	// -1 = leave unchanged (0 legitimately turns slow mode off).
+	slowmode := -1
+	if req.SlowmodeSeconds != nil && *req.SlowmodeSeconds >= 0 {
+		slowmode = *req.SlowmodeSeconds
 	}
-	if req.Icon != "" || req.CoverPhoto != "" {
-		h.DB.Exec(`UPDATE communities SET name=$1,description=$2,rules=$3,category=$4,visibility=$5,tags=$6,
-			icon=COALESCE(NULLIF($7,''),icon), cover_photo=COALESCE(NULLIF($8,''),cover_photo) WHERE id=$9`,
-			req.Name, req.Description, req.Rules, req.Category, req.Visibility,
-			tagsArray, req.Icon, req.CoverPhoto, commID)
-	} else {
-		h.DB.Exec(`UPDATE communities SET name=$1,description=$2,rules=$3,category=$4,visibility=$5,tags=$6 WHERE id=$7`,
-			req.Name, req.Description, req.Rules, req.Category, req.Visibility,
-			tagsArray, commID)
+	blockLinks := -1 // -1 unchanged, 1 on, 0 off
+	if req.AutomodBlockLinks != nil {
+		if *req.AutomodBlockLinks {
+			blockLinks = 1
+		} else {
+			blockLinks = 0
+		}
+	}
+	// Words list: only touch it when the client actually sent the field.
+	automodWords := ""
+	automodWordsSet := false
+	if req.AutomodWords != nil {
+		automodWords = *req.AutomodWords
+		automodWordsSet = true
+	}
+
+	// Every text field merges instead of overwriting: partial payloads (e.g.
+	// the photo-change call that only sends icon/cover_photo, or a slow-mode
+	// toggle that sends nothing else) used to BLANK every field they didn't
+	// include — wiping the community's name, description, rules, etc.
+	_, err := h.DB.Exec(`UPDATE communities SET
+		name=COALESCE(NULLIF($1,''),name),
+		description=COALESCE(NULLIF($2,''),description),
+		rules=COALESCE(NULLIF($3,''),rules),
+		category=COALESCE(NULLIF($4,''),category),
+		visibility=COALESCE(NULLIF($5,''),visibility),
+		icon=COALESCE(NULLIF($6,''),icon),
+		cover_photo=COALESCE(NULLIF($7,''),cover_photo),
+		slowmode_seconds=CASE WHEN $8>=0 THEN $8 ELSE slowmode_seconds END,
+		tags=CASE WHEN $9<>'' THEN $9::text[] ELSE tags END,
+		automod_block_links=CASE WHEN $10>=0 THEN $10=1 ELSE automod_block_links END,
+		automod_words=CASE WHEN $12 THEN $11 ELSE automod_words END
+		WHERE id=$13`,
+		req.Name, req.Description, req.Rules, req.Category, req.Visibility,
+		req.Icon, req.CoverPhoto, slowmode, tagsArray, blockLinks, automodWords,
+		automodWordsSet, commID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
 	}
 	c.JSON(200, gin.H{"ok": true})
 }
@@ -930,9 +1114,13 @@ func (h *CommunityHandler) GetMessages(c *gin.Context) {
 	query := `
 		SELECT cmsg.id, cmsg.user_id, u.username, COALESCE(u.profile_photo,''),
 		       COALESCE(cmsg.body,''), COALESCE(cmsg.media_url,''), COALESCE(cmsg.media_type,''),
-		       cmsg.created_at
+		       cmsg.created_at, cmsg.edited_at,
+		       cmsg.reply_to_id, COALESCE(rm.body,''), COALESCE(ru.username,''),
+		       COALESCE(u.reputation,0)
 		FROM community_messages cmsg
 		JOIN users u ON u.id = cmsg.user_id
+		LEFT JOIN community_messages rm ON rm.id = cmsg.reply_to_id
+		LEFT JOIN users ru ON ru.id = rm.user_id
 		WHERE cmsg.community_id=$1`
 	args := []interface{}{commID}
 	if before > 0 {
@@ -948,17 +1136,39 @@ func (h *CommunityHandler) GetMessages(c *gin.Context) {
 	}
 	defer rows.Close()
 	var messages []gin.H
+	var pageIDs []int64
 	for rows.Next() {
-		var id, uid int64
+		var id, uid, rep int64
 		var uname, photo, body, mediaURL, mediaType, ca string
-		if rows.Scan(&id, &uid, &uname, &photo, &body, &mediaURL, &mediaType, &ca) != nil {
+		var editedAt sql.NullString
+		var replyTo sql.NullInt64
+		var replyBody sql.NullString
+		var replyUsername sql.NullString
+		if rows.Scan(&id, &uid, &uname, &photo, &body, &mediaURL, &mediaType, &ca, &editedAt,
+			&replyTo, &replyBody, &replyUsername, &rep) != nil {
 			continue
 		}
+		pageIDs = append(pageIDs, id)
 		messages = append(messages, gin.H{
 			"id": id, "user_id": uid, "username": uname, "profile_photo": photo,
 			"body": body, "media_url": mediaURL, "media_type": mediaType,
-			"created_at": ca, "is_mine": uid == callerID,
+			"created_at": ca, "edited_at": editedAt.String, "is_mine": uid == callerID,
+			"reply_to_id":    replyTo.Int64,
+			"reply_body":     truncateRunes(replyBody.String, 140),
+			"reply_username": replyUsername.String,
+			"verified":       rep >= verifiedRepThreshold,
+			"reactions":      []gin.H{},
 		})
+	}
+	// Reactions for exactly this page — one grouped query, keyed per message.
+	if len(pageIDs) > 0 {
+		summary := h.reactionsSummary(pageIDs, callerID)
+		for _, m := range messages {
+			id := m["id"].(int64)
+			if rs, ok := summary[id]; ok {
+				m["reactions"] = rs
+			}
+		}
 	}
 	// Reverse to chronological order (oldest first) since we queried DESC for LIMIT.
 	for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
@@ -972,15 +1182,19 @@ func (h *CommunityHandler) GetMessages(c *gin.Context) {
 
 // SendMessage posts a text and/or media message to the community's chat.
 // Muted members are blocked; everyone else who's an active member can send.
+// When the owner enabled slow mode, regular members are rate-limited to one
+// message per N seconds (mods/admins/owner are exempt). @Username mentions
+// inside the body ping that member via a notification.
 func (h *CommunityHandler) SendMessage(c *gin.Context) {
 	callerID := c.GetInt64("user_id")
 	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
-	status := ""
-	h.DB.QueryRow(`SELECT status FROM community_members WHERE community_id=$1 AND user_id=$2`, commID, callerID).Scan(&status)
-	if status == "" {
+	role := h.getMemberRole(commID, callerID)
+	if role == "" {
 		c.JSON(403, gin.H{"error": "join the community to chat"})
 		return
 	}
+	status := ""
+	h.DB.QueryRow(`SELECT status FROM community_members WHERE community_id=$1 AND user_id=$2`, commID, callerID).Scan(&status)
 	if status == "muted" {
 		c.JSON(403, gin.H{"error": "you've been muted in this community"})
 		return
@@ -989,34 +1203,376 @@ func (h *CommunityHandler) SendMessage(c *gin.Context) {
 		Body      string `json:"body"`
 		MediaURL  string `json:"media_url"`
 		MediaType string `json:"media_type"`
+		ReplyTo   int64  `json:"reply_to"`
 	}
 	c.ShouldBindJSON(&req)
 	if strings.TrimSpace(req.Body) == "" && req.MediaURL == "" {
 		c.JSON(400, gin.H{"error": "message is empty"})
 		return
 	}
+
+	// Slow mode — one message per slowmode_seconds for regular members.
+	var slowmode int
+	h.DB.QueryRow(`SELECT COALESCE(slowmode_seconds,0) FROM communities WHERE id=$1`, commID).Scan(&slowmode)
+	if slowmode > 0 && !canModerate(role) {
+		var elapsed float64
+		err := h.DB.QueryRow(`SELECT EXTRACT(EPOCH FROM NOW()-created_at) FROM community_messages
+			WHERE community_id=$1 AND user_id=$2 ORDER BY id DESC LIMIT 1`, commID, callerID).Scan(&elapsed)
+		if err == nil && elapsed < float64(slowmode) {
+			wait := int(float64(slowmode) - elapsed + 1)
+			c.JSON(429, gin.H{"error": "slow mode is on — wait a few seconds", "retry_after": wait})
+			return
+		}
+	}
+
+	// Auto-mod — server-side rules configured by the owner/admin. Mods are
+	// exempt so cleanup work never gets blocked by their own bot.
+	var blockLinks bool
+	var blockedWords string
+	h.DB.QueryRow(`SELECT COALESCE(automod_block_links,false), COALESCE(automod_words,'')
+		FROM communities WHERE id=$1`, commID).Scan(&blockLinks, &blockedWords)
+	if !canModerate(role) {
+		body := strings.ToLower(req.Body)
+		if blockLinks && linkRe.MatchString(body) {
+			c.JSON(403, gin.H{"error": "links aren't allowed in this community"})
+			return
+		}
+		for _, w := range strings.Split(blockedWords, ",") {
+			w = strings.TrimSpace(strings.ToLower(w))
+			if w != "" && strings.Contains(body, w) {
+				c.JSON(403, gin.H{"error": "message goes against this community's rules"})
+				return
+			}
+		}
+	}
+
+	// A reply must point at a message in this same room.
+	replyTo := sql.NullInt64{}
+	if req.ReplyTo > 0 {
+		var ok int
+		if h.DB.QueryRow(`SELECT 1 FROM community_messages WHERE id=$1 AND community_id=$2`,
+			req.ReplyTo, commID).Scan(&ok) == nil {
+			replyTo = sql.NullInt64{Int64: req.ReplyTo, Valid: true}
+		}
+	}
+
 	var id int64
 	var createdAt string
-	err := h.DB.QueryRow(`INSERT INTO community_messages(community_id,user_id,body,media_url,media_type)
-		VALUES($1,$2,$3,$4,$5) RETURNING id, created_at`,
-		commID, callerID, req.Body, req.MediaURL, req.MediaType).Scan(&id, &createdAt)
+	err := h.DB.QueryRow(`INSERT INTO community_messages(community_id,user_id,body,media_url,media_type,reply_to_id)
+		VALUES($1,$2,$3,$4,$5,$6) RETURNING id, created_at`,
+		commID, callerID, req.Body, req.MediaURL, req.MediaType, replyTo).Scan(&id, &createdAt)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
 	var username, photo string
-	h.DB.QueryRow(`SELECT username, COALESCE(profile_photo,'') FROM users WHERE id=$1`, callerID).Scan(&username, &photo)
+	var senderRep int64
+	h.DB.QueryRow(`SELECT username, COALESCE(profile_photo,''), COALESCE(reputation,0) FROM users WHERE id=$1`,
+		callerID).Scan(&username, &photo, &senderRep)
+
+	// Reply context rides along in the broadcast so clients render the
+	// quoted header without an extra fetch.
+	replyBody, replyUsername := "", ""
+	if replyTo.Valid {
+		h.DB.QueryRow(`SELECT COALESCE(body,''), COALESCE((SELECT username FROM users WHERE id=user_id),'')
+			FROM community_messages WHERE id=$1`, replyTo.Int64).Scan(&replyBody, &replyUsername)
+	}
 
 	payload := gin.H{
 		"type": "community_message", "community_id": commID,
 		"id": id, "user_id": callerID, "username": username, "profile_photo": photo,
 		"body": req.Body, "media_url": req.MediaURL, "media_type": req.MediaType,
 		"created_at": createdAt,
+		"reply_to_id":    replyTo.Int64,
+		"reply_body":     truncateRunes(replyBody, 140),
+		"reply_username": replyUsername,
+		"verified":       senderRep >= verifiedRepThreshold,
+		"reactions":      []gin.H{},
 	}
 	if h.Hub != nil {
 		h.Hub.Broadcast(payload)
 	}
+
+	// @mentions → notification for each member named in the body (never for
+	// the sender, never duplicated within one message).
+	var commName string
+	h.DB.QueryRow(`SELECT name FROM communities WHERE id=$1`, commID).Scan(&commName)
+
+	// Only notify the person this message is actually directed at:
+	//  - the author of the message being replied to, and
+	//  - anyone @mentioned (handled in the loop below).
+	// We deliberately do NOT ping every member on every message.
+	if replyTo.Valid {
+		var replyAuthor int64
+		if h.DB.QueryRow(`SELECT user_id FROM community_messages WHERE id=$1`, replyTo.Int64).Scan(&replyAuthor) == nil && replyAuthor != callerID {
+			NotifyWithWS(h.DB, h.Hub, replyAuthor, callerID, "community_message",
+				username+" replied to you in "+commName,
+				truncateRunes(req.Body, 80), "community", commID)
+		}
+	}
+
+	for _, m := range mentionRe.FindAllStringSubmatch(req.Body, -1) {
+		var mentioned int64
+		err := h.DB.QueryRow(`SELECT cm.user_id FROM community_members cm
+			JOIN users u ON u.id=cm.user_id
+			WHERE cm.community_id=$1 AND cm.status='active' AND LOWER(u.username)=LOWER($2)`,
+			commID, m[1]).Scan(&mentioned)
+		if err != nil || mentioned == callerID {
+			continue
+		}
+		PushNotification(h.DB, mentioned, callerID, "community_mention",
+			username+" mentioned you in "+commName,
+			truncateRunes(req.Body, 80), "community", commID)
+		if h.Hub != nil {
+			h.Hub.SendToUser(mentioned, gin.H{
+				"type": "notification", "notif_type": "community_mention",
+				"title": username + " mentioned you",
+				"body":  truncateRunes(req.Body, 80),
+				"community_id": commID, "message_id": id,
+				"actor_username": username, "actor_photo": photo,
+			})
+		}
+	}
 	c.JSON(200, gin.H{"id": id, "created_at": createdAt})
+}
+
+var mentionRe = regexp.MustCompile(`@([A-Za-z0-9_]{3,30})`)
+
+var linkRe = regexp.MustCompile(`(?i)(https?://|www\.|t\.me/|chat\.whatsapp\.com)`)
+
+func truncateRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "…"
+}
+
+// EditMessage lets the sender update their own text (media messages can't be
+// edited — delete and repost instead). Everyone in the room learns about it
+// live via a community_message_edit broadcast.
+func (h *CommunityHandler) EditMessage(c *gin.Context) {
+	callerID := c.GetInt64("user_id")
+	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	msgID, _ := strconv.ParseInt(c.Param("mid"), 10, 64)
+
+	var ownerID int64
+	var mediaURL string
+	err := h.DB.QueryRow(`SELECT user_id, COALESCE(media_url,'') FROM community_messages
+		WHERE id=$1 AND community_id=$2`, msgID, commID).Scan(&ownerID, &mediaURL)
+	if err != nil {
+		c.JSON(404, gin.H{"error": "message not found"})
+		return
+	}
+	if ownerID != callerID {
+		c.JSON(403, gin.H{"error": "you can only edit your own messages"})
+		return
+	}
+	var req struct {
+		Body string `json:"body"`
+	}
+	c.ShouldBindJSON(&req)
+	if strings.TrimSpace(req.Body) == "" {
+		c.JSON(400, gin.H{"error": "message is empty"})
+		return
+	}
+	var editedAt sql.NullString
+	err = h.DB.QueryRow(`UPDATE community_messages SET body=$1, edited_at=CURRENT_TIMESTAMP
+		WHERE id=$2 RETURNING to_char(edited_at,'YYYY-MM-DD"T"HH24:MI:SS"Z"')`,
+		req.Body, msgID).Scan(&editedAt)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	if h.Hub != nil {
+		h.Hub.Broadcast(gin.H{
+			"type": "community_message_edit", "community_id": commID,
+			"id": msgID, "body": req.Body, "edited_at": editedAt.String,
+		})
+	}
+	c.JSON(200, gin.H{"ok": true, "edited_at": editedAt.String})
+}
+
+// DeleteMessage removes a chat message. The sender can always delete their
+// own; owners/admins/moderators can delete anyone's (moderation).
+func (h *CommunityHandler) DeleteMessage(c *gin.Context) {
+	callerID := c.GetInt64("user_id")
+	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	msgID, _ := strconv.ParseInt(c.Param("mid"), 10, 64)
+
+	var ownerID int64
+	err := h.DB.QueryRow(`SELECT user_id FROM community_messages
+		WHERE id=$1 AND community_id=$2`, msgID, commID).Scan(&ownerID)
+	if err != nil {
+		c.JSON(404, gin.H{"error": "message not found"})
+		return
+	}
+	if ownerID != callerID && !canModerate(h.getMemberRole(commID, callerID)) {
+		c.JSON(403, gin.H{"error": "only the sender or a moderator can delete this message"})
+		return
+	}
+	if _, err := h.DB.Exec(`DELETE FROM community_messages WHERE id=$1`, msgID); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	if h.Hub != nil {
+		h.Hub.Broadcast(gin.H{
+			"type": "community_message_delete", "community_id": commID, "id": msgID,
+		})
+	}
+	c.JSON(200, gin.H{"ok": true})
+}
+
+// verifiedRepThreshold doubles as the "Community Expert" badge cutoff —
+// members at/above it get a check next to their name in chat and lists.
+const verifiedRepThreshold = 500
+
+// reactionsSummary groups raw reaction rows into per-emoji chips:
+// [{emoji, count, mine}] for the given message ids, from caller's view.
+func (h *CommunityHandler) reactionsSummary(msgIDs []int64, callerID int64) map[int64][]gin.H {
+	out := map[int64][]gin.H{}
+	rows, err := h.DB.Query(`SELECT message_id, emoji, COUNT(*), BOOL_OR(user_id=$2)
+		FROM community_message_reactions WHERE message_id = ANY($1)
+		GROUP BY message_id, emoji ORDER BY MIN(id)`, pq.Array(msgIDs), callerID)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var mid int64
+		var emoji string
+		var cnt int
+		var mine bool
+		if rows.Scan(&mid, &emoji, &cnt, &mine) != nil {
+			continue
+		}
+		out[mid] = append(out[mid], gin.H{"emoji": emoji, "count": cnt, "mine": mine})
+	}
+	return out
+}
+
+// ReactMessage toggles the caller's emoji on a chat message. Reputation is
+// symmetric: the author gains +1 when someone's first reaction lands and
+// loses it back if they withdraw every reaction — no farming either way.
+func (h *CommunityHandler) ReactMessage(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	msgID, _ := strconv.ParseInt(c.Param("mid"), 10, 64)
+	var req struct {
+		Emoji string `json:"emoji"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Emoji) == "" {
+		c.JSON(400, gin.H{"error": "emoji required"})
+		return
+	}
+	if len([]rune(req.Emoji)) > 8 {
+		c.JSON(400, gin.H{"error": "invalid emoji"})
+		return
+	}
+	var authorID int64
+	err := h.DB.QueryRow(`SELECT user_id FROM community_messages WHERE id=$1 AND community_id=$2`,
+		msgID, commID).Scan(&authorID)
+	if err != nil {
+		c.JSON(404, gin.H{"error": "message not found"})
+		return
+	}
+
+	var before int
+	h.DB.QueryRow(`SELECT COUNT(*) FROM community_message_reactions
+		WHERE message_id=$1 AND user_id=$2`, msgID, userID).Scan(&before)
+
+	var existing int
+	toggleOff := h.DB.QueryRow(`SELECT COUNT(*) FROM community_message_reactions
+		WHERE message_id=$1 AND user_id=$2 AND emoji=$3`, msgID, userID, req.Emoji).Scan(&existing) == nil &&
+		existing > 0
+	if toggleOff {
+		h.DB.Exec(`DELETE FROM community_message_reactions
+			WHERE message_id=$1 AND user_id=$2 AND emoji=$3`, msgID, userID, req.Emoji)
+	} else {
+		// One reaction per person — remove any existing reaction first.
+		h.DB.Exec(`DELETE FROM community_message_reactions
+			WHERE message_id=$1 AND user_id=$2`, msgID, userID)
+		h.DB.Exec(`INSERT INTO community_message_reactions(message_id,user_id,emoji)
+			VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, msgID, userID, req.Emoji)
+	}
+
+	var after int
+	h.DB.QueryRow(`SELECT COUNT(*) FROM community_message_reactions
+		WHERE message_id=$1 AND user_id=$2`, msgID, userID).Scan(&after)
+
+	if authorID != userID && before != after {
+		delta := 1
+		if after < before {
+			delta = -1 // withdrew their only reaction
+		}
+		h.DB.Exec(`UPDATE users SET reputation=GREATEST(0, reputation+$1) WHERE id=$2`, delta, authorID)
+	}
+
+	summary := h.reactionsSummary([]int64{msgID}, userID)[msgID]
+	if summary == nil {
+		summary = []gin.H{}
+	}
+	if h.Hub != nil {
+		h.Hub.Broadcast(gin.H{
+			"type": "community_message_reaction", "community_id": commID,
+			"id": msgID, "reactions": summary,
+		})
+	}
+	c.JSON(200, gin.H{"reactions": summary})
+}
+
+// ReactionUsers returns the list of users who reacted with a specific emoji
+// on a message — used by the frontend "who reacted" popup.
+func (h *CommunityHandler) ReactionUsers(c *gin.Context) {
+	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	msgID, _ := strconv.ParseInt(c.Param("mid"), 10, 64)
+	emoji := c.Param("emoji")
+	rows, err := h.DB.Query(`SELECT u.id, u.username, COALESCE(u.profile_photo,'')
+		FROM community_message_reactions r
+		JOIN users u ON u.id = r.user_id
+		WHERE r.message_id = $1 AND r.emoji = $2
+		ORDER BY r.created_at`, msgID, emoji)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+	users := []gin.H{}
+	for rows.Next() {
+		var uid int64
+		var username, photo string
+		if rows.Scan(&uid, &username, &photo) != nil {
+			continue
+		}
+		users = append(users, gin.H{"id": uid, "username": username, "profile_photo": photo})
+	}
+	_ = commID
+	c.JSON(200, gin.H{"users": users})
+}
+
+// Online lists which of a community's active members currently have a live
+// websocket connection. The client combines this with the global `presence`
+// events the hub already pushes to keep the dots moving without polling.
+func (h *CommunityHandler) Online(c *gin.Context) {
+	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	rows, err := h.DB.Query(`SELECT user_id FROM community_members
+		WHERE community_id=$1 AND status='active'`, commID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+	online := []int64{}
+	for rows.Next() {
+		var uid int64
+		if rows.Scan(&uid) != nil {
+			continue
+		}
+		if h.Hub != nil && h.Hub.IsOnline(uid) {
+			online = append(online, uid)
+		}
+	}
+	c.JSON(200, gin.H{"online": online})
 }
 
 // CanCall reports whether the caller meets the reputation bar this

@@ -24,8 +24,11 @@ type User struct {
 	Reputation      int     `json:"reputation"`
 
 	// Approximate location (LGA/State) used for "nearby" discovery
-	LGA   string `json:"lga"`
-	State string `json:"state"`
+	LGA          string `json:"lga"`
+	State        string `json:"state"`
+	LocationText string `json:"location_text,omitempty"`
+	Latitude     string `json:"latitude,omitempty"`
+	Longitude    string `json:"longitude,omitempty"`
 
 	// Business profile details (only meaningful when AccountType == "business")
 	BusinessName     string `json:"business_name,omitempty"`

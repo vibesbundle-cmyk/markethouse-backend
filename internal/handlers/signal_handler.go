@@ -124,6 +124,17 @@ func (h *SignalHandler) NearbyFeed(c *gin.Context) {
 		    )
 		  ) <= $3
 		  AND p.user_id != $4
+		  AND (
+		    p.audience = 'public'
+		    OR (p.audience = 'followers' AND (
+		      p.user_id = $4
+		      OR EXISTS(SELECT 1 FROM follows f WHERE f.following_id = p.user_id AND f.follower_id = $4)
+		    ))
+		    OR (p.audience = 'private' AND (
+		      p.user_id = $4
+		      OR ',' || p.audience_user_ids || ',' LIKE '%,' || $4 || ',%'
+		    ))
+		  )
 		ORDER BY COALESCE(p.quality_score,0) DESC, p.created_at DESC
 		LIMIT 50`, lat, lng, radiusKm, userID)
 	if err != nil {

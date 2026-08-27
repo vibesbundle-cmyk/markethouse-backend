@@ -72,12 +72,24 @@ CREATE TABLE IF NOT EXISTS posts (
   price       NUMERIC DEFAULT 0,
   is_locked   BOOLEAN DEFAULT false,
   tagged_users TEXT NOT NULL DEFAULT '',
+  location     TEXT NOT NULL DEFAULT '',
+  latitude     DOUBLE PRECISION,
+  longitude    DOUBLE PRECISION,
+  audience     TEXT NOT NULL DEFAULT 'public',
+  audience_user_ids TEXT NOT NULL DEFAULT '',
   created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_posts_user_id    ON posts(user_id);
 CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at);
+
+-- Self-healing for pre-existing DBs that were created before these columns.
+ALTER TABLE posts ADD COLUMN IF NOT EXISTS location TEXT NOT NULL DEFAULT '';
+ALTER TABLE posts ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;
+ALTER TABLE posts ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
+ALTER TABLE posts ADD COLUMN IF NOT EXISTS audience TEXT NOT NULL DEFAULT 'public';
+ALTER TABLE posts ADD COLUMN IF NOT EXISTS audience_user_ids TEXT NOT NULL DEFAULT '';
 
 -- ── LIKES / SAVES / COMMENTS ─────────────────────────────────
 CREATE TABLE IF NOT EXISTS likes (
@@ -1592,3 +1604,22 @@ CREATE TABLE IF NOT EXISTS user_contacts (
 
 CREATE INDEX IF NOT EXISTS idx_user_contacts_user ON user_contacts(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_contacts_hash ON user_contacts(phone_hash);
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- SCHEDULED TRANSFERS
+-- ═══════════════════════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS scheduled_transfers (
+  id            SERIAL PRIMARY KEY,
+  sender_id     INTEGER NOT NULL REFERENCES users(id),
+  receiver_id   INTEGER NOT NULL REFERENCES users(id),
+  amount        NUMERIC(15,2) NOT NULL CHECK (amount > 0),
+  description   TEXT DEFAULT '',
+  scheduled_at  TIMESTAMP NOT NULL,
+  status        TEXT DEFAULT 'pending', -- pending | completed | cancelled
+  created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  executed_at   TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_sched_transfer_pending
+  ON scheduled_transfers(status, scheduled_at)
+  WHERE status = 'pending';

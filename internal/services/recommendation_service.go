@@ -350,6 +350,17 @@ func (s *RecommendationService) BuildForYouFeed(userID int64, lat, lng *float64,
 		WHERE p.is_locked = false
 		  AND p.user_id != $1
 		  AND NOT EXISTS(SELECT 1 FROM blocks WHERE blocker_id=$1 AND blocked_id=p.user_id)
+		  AND (
+		    p.audience = 'public'
+		    OR (p.audience = 'followers' AND (
+		      p.user_id = $1
+		      OR EXISTS(SELECT 1 FROM follows f WHERE f.following_id = p.user_id AND f.follower_id = $1)
+		    ))
+		    OR (p.audience = 'private' AND (
+		      p.user_id = $1
+		      OR ',' || p.audience_user_ids || ',' LIKE '%,' || $1 || ',%'
+		    ))
+		  )
 		ORDER BY p.created_at DESC
 		LIMIT $3`, userID, lat, limit*3)
 	if err != nil {

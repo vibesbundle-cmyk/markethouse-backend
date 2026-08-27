@@ -1,8 +1,10 @@
 package services
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"mime/multipart"
 	"time"
 
@@ -10,12 +12,14 @@ import (
 	"markethouse/internal/models"
 	"markethouse/internal/repository"
 	"markethouse/internal/storage"
+	"markethouse/pkg/utils"
 )
 
 type ShopService struct {
-	Repo     *repository.ShopRepo
-	Storage  storage.Storage
-	Payment  config.PaymentProvider
+	Repo               *repository.ShopRepo
+	Storage            storage.Storage
+	Payment            config.PaymentProvider
+	CheckedWalletSchema bool
 }
 
 // ── PRODUCTS ─────────────────────────────────────────────────────────────────
@@ -53,18 +57,20 @@ func (s *ShopService) GetMyProducts(vendorID int64) ([]models.Product, error) {
 
 // ── CART ─────────────────────────────────────────────────────────────────────
 
-func (s *ShopService) AddToCart(userID, productID int64, qty int) error {
+func (s *ShopService) AddToCart(userID, listingID int64, qty int) error {
 	if qty <= 0 {
 		return errors.New("quantity must be at least 1")
 	}
-	prod, err := s.Repo.GetProductByID(productID)
+	// listingID is a commerce_listings.id; the mirror product row is created
+	// on demand so listings created before this bridge still work.
+	prod, err := s.Repo.EnsureProductForListing(listingID)
 	if err != nil {
-		return errors.New("product not found")
+		return errors.New("listing not found")
 	}
 	if !prod.IsUnlimitedStock && prod.StockCount < qty {
 		return fmt.Errorf("only %d left in stock", prod.StockCount)
 	}
-	return s.Repo.AddToCart(userID, productID, qty)
+	return s.Repo.AddToCart(userID, prod.ID, qty)
 }
 
 func (s *ShopService) GetCart(userID int64) ([]models.CartItem, float64, error) {
@@ -135,6 +141,118 @@ type CheckoutResult struct {
 	Quantity         int
 }
 
+// ── BATCH CHECKOUT (pay the whole cart / a selection in one payment) ────────
+
+type BatchItem struct {
+	ProductID int64 `json:"product_id"`
+	Quantity  int   `json:"quantity"`
+}
+
+type BatchOrderOut struct {
+	OrderID      int64   `json:"order_id"`
+	ProductID    int64   `json:"product_id"`
+	ProductName  string  `json:"product_name"`
+	VendorID     int64   `json:"vendor_id"`
+	Quantity     int     `json:"quantity"`
+	Total        float64 `json:"total"`
+	DeliveryCode string  `json:"delivery_code"`
+}
+
+type BatchCheckoutResult struct {
+	Reference        string          `json:"reference"`
+	AuthorizationURL string          `json:"authorization_url"`
+	Total            float64         `json:"total"`
+	Orders           []BatchOrderOut `json:"orders"`
+}
+
+// CheckoutBatch validates every cart item, initialises ONE payment for the
+// grand total and parks each item as a 'pending' order sharing the reference.
+func (s *ShopService) CheckoutBatch(buyerID int64, items []BatchItem, deliveryDate *time.Time, buyerEmail string) (*BatchCheckoutResult, error) {
+	if len(items) == 0 {
+		return nil, errors.New("no items to check out")
+	}
+	var grandTotal float64
+	prods := make(map[int64]*models.Product)
+	for _, it := range items {
+		if it.Quantity <= 0 {
+			return nil, errors.New("quantity must be at least 1")
+		}
+		prod, err := s.Repo.GetProductByID(it.ProductID)
+		if err != nil {
+			return nil, fmt.Errorf("product #%d not found", it.ProductID)
+		}
+		if !prod.IsUnlimitedStock && prod.StockCount < it.Quantity {
+			return nil, fmt.Errorf("only %d of %s left in stock", prod.StockCount, prod.Name)
+		}
+		prods[it.ProductID] = prod
+		grandTotal += prod.Price * float64(it.Quantity)
+	}
+
+	ref := repository.GenerateTxRef()
+	initResp, err := s.Payment.InitializePayment(config.InitPaymentRequest{
+		AmountKobo:  int64(grandTotal * 100),
+		Email:       buyerEmail,
+		Reference:   ref,
+		CallbackURL: "markethouse://payment/callback",
+		Metadata:    map[string]string{"batch": "true"},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("payment init failed: %w", err)
+	}
+
+	out := BatchCheckoutResult{Reference: initResp.Reference, AuthorizationURL: initResp.AuthorizationURL, Total: grandTotal}
+	for _, it := range items {
+		prod := prods[it.ProductID]
+		total := prod.Price * float64(it.Quantity)
+		id, code, err := s.Repo.CreatePendingOrder(models.Order{
+			BuyerID:               buyerID,
+			VendorID:              prod.UserID,
+			ProductID:             prod.ID,
+			Quantity:              it.Quantity,
+			TotalPrice:            total,
+			DeliveryDateScheduled: deliveryDate,
+		}, initResp.Reference)
+		if err != nil {
+			return nil, fmt.Errorf("could not create order for %s: %w", prod.Name, err)
+		}
+		out.Orders = append(out.Orders, BatchOrderOut{
+			OrderID: id, ProductID: prod.ID, ProductName: prod.Name,
+			VendorID: prod.UserID, Quantity: it.Quantity, Total: total, DeliveryCode: code,
+		})
+	}
+	return &out, nil
+}
+
+// ConfirmBatchPayment verifies the shared payment, flips every pending order
+// under that reference to 'paid', moves escrow and bumps vendor sales scores.
+func (s *ShopService) ConfirmBatchPayment(buyerID int64, reference string) ([]models.Order, error) {
+	verify, err := s.Payment.VerifyPayment(reference)
+	if err != nil || !verify.Paid {
+		return nil, errors.New("payment verification failed")
+	}
+	orders, err := s.Repo.GetPendingOrdersByReference(buyerID, reference)
+	if err != nil || len(orders) == 0 {
+		return nil, errors.New("no pending orders for this payment")
+	}
+	for i := range orders {
+		o := orders[i]
+		if err := s.Repo.MarkOrderPaid(o.ID); err != nil {
+			continue
+		}
+		_ = s.Repo.UpdateProductStock(o.ProductID, -o.Quantity)
+		_ = s.Repo.AddWalletTransaction(models.WalletTransaction{
+			UserID:      o.BuyerID,
+			OrderID:     &o.ID,
+			Type:        models.TxEscrowIn,
+			Amount:      o.EscrowAmount,
+			Description: fmt.Sprintf("Escrow for order #%d — %s", o.ID, o.ProductName),
+		})
+		_, _ = s.Repo.DB.Exec(`UPDATE users SET sales_score = sales_score + 1 WHERE id=$1`, o.VendorID)
+		orders[i].Status = models.OrderPaid
+	}
+	return orders, nil
+}
+
 // ConfirmPayment — called after the payment gateway callback/webhook.
 // Verifies with the provider, creates the order, deducts stock, records wallet tx.
 func (s *ShopService) ConfirmPayment(buyerID int64, req CheckoutRequest, reference string) (*models.Order, error) {
@@ -165,6 +283,10 @@ func (s *ShopService) ConfirmPayment(buyerID int64, req CheckoutRequest, referen
 	if err != nil {
 		return nil, fmt.Errorf("order creation failed: %w", err)
 	}
+
+	// Every completed payment bumps the vendor's sales score (the number on
+	// their business badge).
+	_, _ = s.Repo.DB.Exec(`UPDATE users SET sales_score = sales_score + 1 WHERE id=$1`, prod.UserID)
 
 	// Deduct stock (for limited goods)
 	_ = s.Repo.UpdateProductStock(req.ProductID, -req.Quantity)
@@ -291,38 +413,169 @@ func (s *ShopService) GetWalletHistory(userID int64) ([]models.WalletTransaction
 	return s.Repo.GetWalletHistory(userID)
 }
 
-func (s *ShopService) CreditWallet(userID int64, amount float64, txType, desc, ref string) error {
-	_, err := s.Repo.DB.Exec(`
-		WITH w AS (
-			INSERT INTO wallets(user_id,balance) VALUES($1,0)
-			ON CONFLICT(user_id) DO UPDATE SET balance=wallets.balance+$2
-			RETURNING id
-		)
-		INSERT INTO wallet_transactions(wallet_id,user_id,type,amount,description,reference,status)
-		SELECT id,$1,$3,$2,$4,$5,'completed' FROM w`,
-		userID, amount, txType, desc, ref)
-	return err
-}
-
-func (s *ShopService) DebitWallet(userID int64, amount float64, txType, desc, ref string) error {
-	var balance float64
-	err := s.Repo.DB.QueryRow(`SELECT balance FROM wallets WHERE user_id=$1`, userID).Scan(&balance)
-	if err != nil || balance < amount {
-		return fmt.Errorf("insufficient balance")
+func (s *ShopService) CreditWallet(userID int64, amount float64, txType, desc, ref string, counterparty int64) error {
+	if ref == "" {
+		ref = repository.GenerateTxRef()
 	}
-	_, err = s.Repo.DB.Exec(`
-		WITH w AS (
-			UPDATE wallets SET balance=balance-$2 WHERE user_id=$1 RETURNING id
-		)
-		INSERT INTO wallet_transactions(wallet_id,user_id,type,amount,description,reference,status)
-		SELECT id,$1,$3,$2,$4,$5,'completed' FROM w`,
-		userID, amount, txType, desc, ref)
+	log.Printf("[CREDIT] user=%d amt=%.2f type=%s ref=%s", userID, amount, txType, ref)
+	_, err := s.Repo.DB.Exec(`
+		INSERT INTO wallet_transactions(user_id,type,amount,description,reference,status,counterparty_id)
+		VALUES($1,$2,$3,$4,$5,'completed',NULLIF($6,0))`,
+		userID, txType, amount, desc, ref, counterparty)
+	if err != nil {
+		log.Printf("[CREDIT] SQL ERROR: %v", err)
+	}
 	return err
 }
 
-func (s *ShopService) Transfer(senderID, receiverID int64, amount float64, desc string) error {
-	if err := s.DebitWallet(senderID, amount, "transfer", "Sent: "+desc, ""); err != nil {
+func (s *ShopService) DebitWallet(userID int64, amount float64, txType, desc, ref string, counterparty int64) error {
+	if ref == "" {
+		ref = repository.GenerateTxRef()
+	}
+	tx, err := s.Repo.DB.Begin()
+	if err != nil {
 		return err
 	}
-	return s.CreditWallet(receiverID, amount, "credit", "Received: "+desc, "")
+	defer tx.Rollback()
+	if _, err := tx.Exec(`SELECT pg_advisory_xact_lock($1)`, userID); err != nil {
+		return err
+	}
+	var balance float64
+	if err := tx.QueryRow(repository.WalletBalanceSQL, userID).Scan(&balance); err != nil {
+		return fmt.Errorf("could not read balance: %w", err)
+	}
+	if balance < amount {
+		return fmt.Errorf("insufficient balance")
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO wallet_transactions(user_id,type,amount,description,reference,status,counterparty_id)
+		VALUES($1,$2,$3,$4,$5,'completed',NULLIF($6,0))`,
+		userID, txType, amount, desc, ref, counterparty); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *ShopService) Transfer(senderID, receiverID int64, amount float64, desc, pin string) (string, error) {
+	// Enforce the optional transfer password.
+	var hash sql.NullString
+	if err := s.Repo.DB.QueryRow(`SELECT transfer_pin_hash FROM users WHERE id=$1`, senderID).Scan(&hash); err == nil && hash.Valid && hash.String != "" {
+		if !utils.CheckPasswordHash(pin, hash.String) {
+			return "", errors.New("incorrect transfer password")
+		}
+	}
+	// One shared reference for both legs — the sender's receipt and the
+	// receiver's credit can be matched on it.
+	ref := repository.GenerateTxRef()
+	if err := s.DebitWallet(senderID, amount, "transfer", "Sent: "+desc, ref, receiverID); err != nil {
+		return "", err
+	}
+	return ref, s.CreditWallet(receiverID, amount, "credit", "Received: "+desc, ref, senderID)
+}
+
+// ── SCHEDULED TRANSFERS ──────────────────────────────────────────────────────
+
+func (s *ShopService) CreateScheduledTransfer(senderID, receiverID int64, amount float64, desc string, scheduledAt time.Time) (int64, error) {
+	// Verify sender has enough balance
+	balance, err := s.Repo.GetWalletBalance(senderID)
+	if err != nil {
+		return 0, fmt.Errorf("could not check balance: %w", err)
+	}
+	if balance.AvailBalance < amount {
+		return 0, fmt.Errorf("insufficient balance (have ₦%.2f, need ₦%.2f)", balance.AvailBalance, amount)
+	}
+	// Verify scheduled time is in the future
+	if scheduledAt.Before(time.Now()) {
+		return 0, fmt.Errorf("scheduled time must be in the future")
+	}
+	// Verify receiver exists
+	_, err = s.Repo.GetWalletBalance(receiverID)
+	if err != nil {
+		return 0, fmt.Errorf("receiver not found")
+	}
+
+	// Debit sender immediately (held until execution)
+	if err := s.DebitWallet(senderID, amount, "transfer_scheduled",
+		fmt.Sprintf("Scheduled transfer to @%s — %s", s.usernameOf(receiverID), desc), "", receiverID); err != nil {
+		return 0, err
+	}
+
+	return s.Repo.CreateScheduledTransfer(senderID, receiverID, amount, desc, scheduledAt)
+}
+
+func (s *ShopService) ProcessScheduledTransfers() error {
+	pending, err := s.Repo.GetPendingScheduledTransfers()
+	if err != nil {
+		return err
+	}
+	for _, t := range pending {
+		// Credit receiver (money was already debited from sender at creation)
+		if err := s.CreditWallet(t.ReceiverID, t.Amount, "credit",
+			fmt.Sprintf("Scheduled transfer from @%s — %s", s.usernameOf(t.SenderID), t.Description), "", t.SenderID); err != nil {
+			continue
+		}
+		_ = s.Repo.MarkScheduledTransferDone(t.ID)
+	}
+	return nil
+}
+
+// usernameOf resolves a display username for ledger descriptions.
+func (s *ShopService) usernameOf(userID int64) string {
+	var u string
+	_ = s.Repo.DB.QueryRow(`SELECT COALESCE(username,'') FROM users WHERE id=$1`, userID).Scan(&u)
+	if u == "" {
+		return fmt.Sprintf("user%d", userID)
+	}
+	return u
+}
+
+// TransferPinEnabled reports whether the user has a transfer password set.
+func (s *ShopService) TransferPinEnabled(userID int64) bool {
+	var hash sql.NullString
+	if err := s.Repo.DB.QueryRow(`SELECT transfer_pin_hash FROM users WHERE id=$1`, userID).Scan(&hash); err != nil {
+		return false
+	}
+	return hash.Valid && hash.String != ""
+}
+
+// SetTransferPin stores (or rotates) the bcrypt-hashed transfer password.
+// When one already exists, currentPin must match.
+func (s *ShopService) SetTransferPin(userID int64, currentPin, newPin string) error {
+	var hash sql.NullString
+	err := s.Repo.DB.QueryRow(`SELECT transfer_pin_hash FROM users WHERE id=$1`, userID).Scan(&hash)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) && err.Error() != "sql: no rows in result set" {
+		return err
+	}
+	if hash.Valid && hash.String != "" && !utils.CheckPasswordHash(currentPin, hash.String) {
+		return errors.New("incorrect current transfer password")
+	}
+	hashed, err := utils.HashPassword(newPin)
+	if err != nil {
+		return err
+	}
+	_, err = s.Repo.DB.Exec(`UPDATE users SET transfer_pin_hash=$2 WHERE id=$1`, userID, hashed)
+	return err
+}
+
+func (s *ShopService) CancelScheduledTransfer(id, senderID int64) error {
+	// Get the transfer first to know the amount
+	transfers, err := s.Repo.GetScheduledTransfersBySender(senderID)
+	if err != nil {
+		return err
+	}
+	for _, t := range transfers {
+		if t.ID == id && t.Status == "pending" {
+			// Refund sender
+			if err := s.CreditWallet(senderID, t.Amount, "refund",
+				fmt.Sprintf("Cancelled scheduled transfer #%d", id), "", 0); err != nil {
+				return err
+			}
+			return s.Repo.CancelScheduledTransfer(id, senderID)
+		}
+	}
+	return fmt.Errorf("scheduled transfer not found or not cancellable")
+}
+
+func (s *ShopService) GetScheduledTransfers(senderID int64) ([]models.ScheduledTransfer, error) {
+	return s.Repo.GetScheduledTransfersBySender(senderID)
 }

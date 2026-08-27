@@ -27,7 +27,7 @@ type PostService struct {
 	Storage  storage.Storage
 }
 
-func (s *PostService) CreatePost(userID int64, caption, postType, category string, price float64, isLocked bool, taggedUsers string, files []*multipart.FileHeader) (models.Post, error) {
+func (s *PostService) CreatePost(userID int64, caption, postType, category string, price float64, isLocked bool, taggedUsers, location, audience, audienceUserIDs string, lat, lng *float64, files []*multipart.FileHeader) (models.Post, error) {
 	if len(caption) > 2000 {
 		return models.Post{}, errors.New("caption too long (max 2000 chars)")
 	}
@@ -48,6 +48,11 @@ func (s *PostService) CreatePost(userID int64, caption, postType, category strin
 	if price < 0 {
 		return models.Post{}, errors.New("price cannot be negative")
 	}
+	switch audience {
+	case "", "public", "followers", "private":
+	default:
+		return models.Post{}, errors.New("audience must be public, followers or private")
+	}
 
 	media := make([]models.PostMediaItem, 0, len(files))
 	for _, file := range files {
@@ -61,6 +66,9 @@ func (s *PostService) CreatePost(userID int64, caption, postType, category strin
 	if category == "" {
 		category = "Other"
 	}
+	if audience == "" {
+		audience = "public"
+	}
 
 	post := models.Post{
 		UserID:      userID,
@@ -72,6 +80,11 @@ func (s *PostService) CreatePost(userID int64, caption, postType, category strin
 		Price:       price,
 		IsLocked:    isLocked,
 		TaggedUsers: taggedUsers,
+		Location:    location,
+		Latitude:    lat,
+		Longitude:   lng,
+		Audience:    audience,
+		AudienceIDs: audienceUserIDs,
 	}
 
 	if err = s.Repo.CreatePost(&post, media); err != nil {
@@ -156,6 +169,11 @@ func (s *PostService) GetUserPosts(targetUserID, viewerID int64) ([]map[string]i
 	return s.Repo.GetUserPosts(targetUserID, viewerID)
 }
 
+// SetPin pins/unpins a post on the owner's profile (max 3, FIFO eviction).
+func (s *PostService) SetPin(userID, postID int64, pin bool) error {
+	return s.Repo.SetPin(userID, postID, pin)
+}
+
 func (s *PostService) GetFollowingFeed(userID int64) ([]map[string]interface{}, error) {
 	return s.Repo.GetFollowingPosts(userID)
 }
@@ -182,4 +200,12 @@ func (s *PostService) GetPublicFeed(userID int64) ([]map[string]interface{}, err
 
 func (s *PostService) GetBusinessFeed(userID int64) ([]map[string]interface{}, error) {
 	return s.Repo.GetBusinessPosts(userID)
+}
+
+func (s *PostService) GetPostsByHashtag(viewerID int64, tag string) ([]map[string]interface{}, error) {
+	return s.Repo.GetPostsByHashtag(viewerID, tag)
+}
+
+func (s *PostService) GetTrendingHashtags() ([]map[string]interface{}, error) {
+	return s.Repo.GetTrendingHashtags(7, 20)
 }

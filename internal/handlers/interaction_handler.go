@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"database/sql"
 	"strconv"
 
 	"markethouse/internal/services"
@@ -11,6 +12,7 @@ import (
 type InteractionHandler struct {
 	Service *services.InteractionService
 	Hub     *services.Hub
+	DB      *sql.DB
 }
 
 // ================= LIKE =================
@@ -27,6 +29,17 @@ func (h *InteractionHandler) Like(c *gin.Context) {
 	}
 	if h.Hub != nil {
 		h.Hub.Broadcast(map[string]interface{}{"type": "post_like", "post_id": postID, "user_id": userID, "delta": 1})
+	}
+	// Persistent + realtime notification to the post owner.
+	if h.DB != nil {
+		var author int64
+		var caption string
+		h.DB.QueryRow(`SELECT user_id, COALESCE(LEFT(caption, 60), '') FROM posts WHERE id=$1`, postID).Scan(&author, &caption)
+		if author > 0 {
+			actor := userName(h.DB, userID)
+			NotifyWithWS(h.DB, h.Hub, author, userID, "like",
+				actor+" liked your post", "\""+caption+"\"", "post", postID)
+		}
 	}
 	c.JSON(200, gin.H{"message": "liked"})
 }
@@ -71,6 +84,26 @@ func (h *InteractionHandler) Comment(c *gin.Context) {
 	}
 	if h.Hub != nil {
 		h.Hub.Broadcast(map[string]interface{}{"type": "post_comment", "post_id": postID, "comment_id": id, "delta": 1})
+	}
+	// Persistent + realtime notifications: post owner gets told about the
+	// comment, and the parent comment's author (if this is a reply) too.
+	if h.DB != nil {
+		var author int64
+		var caption string
+		h.DB.QueryRow(`SELECT user_id, COALESCE(LEFT(caption, 60), '') FROM posts WHERE id=$1`, postID).Scan(&author, &caption)
+		actor := userName(h.DB, userID)
+		if author > 0 && author != userID {
+			NotifyWithWS(h.DB, h.Hub, author, userID, "comment",
+				actor+" commented on your post", "\""+caption+"\"", "post", postID)
+		}
+		if req.ParentCommentID != nil && *req.ParentCommentID > 0 {
+			var parentAuthor int64
+			h.DB.QueryRow(`SELECT user_id FROM comments WHERE id=$1`, *req.ParentCommentID).Scan(&parentAuthor)
+			if parentAuthor > 0 && parentAuthor != userID {
+				NotifyWithWS(h.DB, h.Hub, parentAuthor, userID, "comment",
+					actor+" replied to your comment", "\""+caption+"\"", "post", postID)
+			}
+		}
 	}
 	c.JSON(200, gin.H{"message": "comment added", "id": id})
 }
@@ -183,6 +216,11 @@ func (h *InteractionHandler) Reshare(c *gin.Context) {
 	if err := h.Service.Reshare(userID, postID); err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
+	}
+	var author int64
+	if h.DB.QueryRow(`SELECT user_id FROM posts WHERE id=$1`, postID).Scan(&author) == nil {
+		NotifyWithWS(h.DB, h.Hub, author, userID, "reshare",
+			userName(h.DB, userID)+" reshared your post", "", "post", postID)
 	}
 	if h.Hub != nil {
 		h.Hub.Broadcast(map[string]interface{}{"type": "post_reshare", "post_id": postID, "user_id": userID, "delta": 1})
