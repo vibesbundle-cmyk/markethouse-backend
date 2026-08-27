@@ -1,5 +1,6 @@
 # Local env & secrets
 .env
+firebase-service-account.json
 
 # Build artifacts
 server.exe
@@ -14,7 +15,10 @@ uploads/
 
 # Go
 vendor/
-`n# Stale Flutter leftovers`npubspec.yaml`npubspec.lock
+
+# Stale Flutter leftovers
+pubspec.yaml
+pubspec.lock
 
 # Build/test binaries
 *.exe
