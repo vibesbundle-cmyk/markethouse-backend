@@ -37,6 +37,17 @@ var (
 
 func loadServiceAccount() *serviceAccount {
 	fcmSALoadOnce.Do(func() {
+		// Try env var first (for Render / cloud deployments)
+		if jsonStr := os.Getenv("FIREBASE_SERVICE_ACCOUNT_JSON"); jsonStr != "" {
+			var sa serviceAccount
+			if err := json.Unmarshal([]byte(jsonStr), &sa); err != nil {
+				log.Println("fcm: invalid FIREBASE_SERVICE_ACCOUNT_JSON:", err)
+				return
+			}
+			fcmSA = &sa
+			return
+		}
+		// Fall back to file (local dev)
 		path := os.Getenv("FIREBASE_SERVICE_ACCOUNT")
 		if path == "" {
 			path = "firebase-service-account.json"
