@@ -191,6 +191,19 @@ func (r *MessageRepo) DeleteMessage(userID, msgID int64) error {
 	return nil
 }
 
+// GetMessageConversation looks up a minimal EnrichedConversation for a
+// given message ID — just enough to know the conversation and the other
+// participant (used for WS notifications on delete).
+func (r *MessageRepo) GetMessageConversation(msgID int64) (EnrichedConversation, error) {
+	var c EnrichedConversation
+	err := r.DB.QueryRow(`
+		SELECT c.id,
+			CASE WHEN c.user_one_id = m.sender_id THEN c.user_two_id ELSE c.user_one_id END
+		FROM messages m JOIN conversations c ON c.id = m.conversation_id
+		WHERE m.id = $1`, msgID).Scan(&c.ID, &c.OtherUserID)
+	return c, err
+}
+
 func (r *MessageRepo) GetPinnedMessages(convID int64) ([]models.Message, error) {
 	rows, err := r.DB.Query(
 		`SELECT id,sender_id,receiver_id,content,is_read,created_at,COALESCE(message_type,'text'),

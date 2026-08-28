@@ -132,7 +132,29 @@ func (s *MessageService) EditMessage(userID, msgID int64, content string) error 
 	return s.Repo.EditMessage(userID, msgID, content)
 }
 func (s *MessageService) DeleteMessage(userID, msgID int64) error {
-	return s.Repo.DeleteMessage(userID, msgID)
+	// Look up the conversation so we can notify the other participant.
+	conv, err := s.Repo.GetMessageConversation(msgID)
+	if err != nil {
+		// Best-effort: still try the delete even if we can't find the conv.
+		return s.Repo.DeleteMessage(userID, msgID)
+	}
+	if err := s.Repo.DeleteMessage(userID, msgID); err != nil {
+		return err
+	}
+	// Notify the other user in real-time so their chat shows the
+	// deleted placeholder immediately instead of requiring a refresh.
+	if s.Hub != nil {
+		otherID := conv.OtherUserID
+		if otherID != userID {
+			s.Hub.SendToUser(otherID, map[string]interface{}{
+				"type":            "message_deleted",
+				"conversation_id": conv.ID,
+				"message_id":      msgID,
+				"sender_id":       userID,
+			})
+		}
+	}
+	return nil
 }
 func (s *MessageService) GetPinnedMessages(convID int64) ([]models.Message, error) {
 	return s.Repo.GetPinnedMessages(convID)

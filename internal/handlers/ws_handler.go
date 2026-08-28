@@ -1,9 +1,11 @@
 package handlers
 
 import (
+	"database/sql"
 	"encoding/json"
 	"markethouse/internal/services"
 	"net/http"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -31,6 +33,7 @@ var upgrader = websocket.Upgrader{
 
 type WSHandler struct {
 	Hub *services.Hub
+	DB  *sql.DB
 }
 
 func (h *WSHandler) HandleWS(c *gin.Context) {
@@ -90,6 +93,28 @@ func (h *WSHandler) HandleWS(c *gin.Context) {
 				payload["is_video"] = v
 			}
 			h.Hub.SendToUser(msg.ReceiverID, payload)
+			// For call_offer, also send a push notification so the
+			// receiver gets pinged even if they aren't on WS right now.
+			if msg.Type == "call_offer" && h.DB != nil {
+				var callerName string
+				h.DB.QueryRow("SELECT COALESCE(full_name, username) FROM users WHERE id=$1", userID).Scan(&callerName)
+				if callerName == "" {
+					callerName = "Someone"
+				}
+				isVideo := false
+				if v, ok := extra["is_video"]; ok {
+					isVideo, _ = v.(bool)
+				}
+				mediaType := "voice"
+				if isVideo {
+					mediaType = "video"
+				}
+				services.SendPush(h.DB, msg.ReceiverID, "Incoming "+mediaType+" call",
+					callerName+" is calling you", map[string]string{
+						"type":      "call_offer",
+						"sender_id": strconv.FormatInt(userID, 10),
+					})
+			}
 		}
 	}
 }

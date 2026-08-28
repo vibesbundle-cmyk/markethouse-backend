@@ -99,7 +99,7 @@ func main() {
 	hub := services.NewHub(redisClient)
 	go hub.Run()
 	authHandler.Hub = hub
-	wsHandler := &handlers.WSHandler{Hub: hub}
+	wsHandler := &handlers.WSHandler{Hub: hub, DB: db}
 
 	// ---------------- FOLLOW ----------------
 	followRepo := &repository.FollowRepo{DB: db}
