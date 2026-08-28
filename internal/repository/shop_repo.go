@@ -193,8 +193,19 @@ func (r *ShopRepo) GetCart(userID int64) ([]models.CartItem, error) {
 }
 
 func (r *ShopRepo) RemoveFromCart(userID, cartItemID int64) error {
-	_, err := r.DB.Exec(
+	// Delete by cart_items.id first; if no rows affected, try by product_id
+	// (the commerce feed sends product_id, not cart_items.id).
+	res, err := r.DB.Exec(
 		`DELETE FROM cart_items WHERE id=$1 AND user_id=$2`, cartItemID, userID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n > 0 {
+		return nil
+	}
+	_, err = r.DB.Exec(
+		`DELETE FROM cart_items WHERE product_id=$1 AND user_id=$2`, cartItemID, userID)
 	return err
 }
 

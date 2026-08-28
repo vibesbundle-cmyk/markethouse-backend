@@ -47,7 +47,7 @@ func (h *CommerceHandler) List(c *gin.Context) {
 		       l.upvotes, l.downvotes,
 		       COALESCE(uv.vote,0),
 		       l.latitude, l.longitude,
-		       EXISTS(SELECT 1 FROM cart_items ci WHERE ci.user_id=$1 AND ci.product_id=l.id) AS is_in_cart`
+		       EXISTS(SELECT 1 FROM cart_items ci WHERE ci.user_id=$1 AND ci.product_id=l.product_id) AS is_in_cart`
 	args := []interface{}{userID}
 	if hasLocation {
 		// Haversine distance in km — plain trig, no PostGIS/earthdistance

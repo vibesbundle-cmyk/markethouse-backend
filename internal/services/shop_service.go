@@ -57,15 +57,20 @@ func (s *ShopService) GetMyProducts(vendorID int64) ([]models.Product, error) {
 
 // ── CART ─────────────────────────────────────────────────────────────────────
 
-func (s *ShopService) AddToCart(userID, listingID int64, qty int) error {
+func (s *ShopService) AddToCart(userID, id int64, qty int) error {
 	if qty <= 0 {
 		return errors.New("quantity must be at least 1")
 	}
-	// listingID is a commerce_listings.id; the mirror product row is created
-	// on demand so listings created before this bridge still work.
-	prod, err := s.Repo.EnsureProductForListing(listingID)
+	// Try as a commerce_listings.id first — EnsureProductForListing will
+	// create/find the mirror product row.
+	prod, err := s.Repo.EnsureProductForListing(id)
 	if err != nil {
-		return errors.New("listing not found")
+		// Fallback: treat id as a raw products.id (Shop tab sends product IDs).
+		p, perr := s.Repo.GetProductByID(id)
+		if perr != nil {
+			return errors.New("listing not found")
+		}
+		prod = p
 	}
 	if !prod.IsUnlimitedStock && prod.StockCount < qty {
 		return fmt.Errorf("only %d left in stock", prod.StockCount)
