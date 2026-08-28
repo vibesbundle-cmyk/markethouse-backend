@@ -77,6 +77,19 @@ func (h *WSHandler) HandleWS(c *gin.Context) {
 				"lat":       msg.Lat,
 				"lng":       msg.Lng,
 			})
+		case "call_offer", "call_answer", "call_reject", "call_end":
+			// Relay call signaling to the other party.
+			payload := map[string]interface{}{
+				"type":      msg.Type,
+				"sender_id": userID,
+			}
+			// Copy extra fields from the raw JSON
+			var extra map[string]interface{}
+			json.Unmarshal(raw, &extra)
+			if v, ok := extra["is_video"]; ok {
+				payload["is_video"] = v
+			}
+			h.Hub.SendToUser(msg.ReceiverID, payload)
 		}
 	}
 }

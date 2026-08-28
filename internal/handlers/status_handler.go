@@ -166,6 +166,16 @@ func (h *StatusHandler) React(c *gin.Context) {
 	}
 	c.ShouldBindJSON(&req)
 	h.DB.Exec(`INSERT INTO status_reactions(status_id,user_id,reaction) VALUES($1,$2,$3) ON CONFLICT(status_id,user_id) DO UPDATE SET reaction=$3`, statusID, userID, req.Reaction)
+
+	// Notify the status owner (skip self-likes)
+	var ownerID int64
+	h.DB.QueryRow(`SELECT user_id FROM statuses WHERE id=$1`, statusID).Scan(&ownerID)
+	if ownerID > 0 && ownerID != userID {
+		actor := userName(h.DB, userID)
+		NotifyWithWS(h.DB, h.Hub, ownerID, userID, "status_reaction",
+			actor+" reacted "+req.Reaction+" to your status", "", "status", statusID)
+	}
+
 	c.JSON(200, gin.H{"ok": true})
 }
 
