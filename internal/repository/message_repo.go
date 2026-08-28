@@ -244,6 +244,8 @@ func (r *MessageRepo) GetPinnedMessages(convID int64) ([]models.Message, error) 
 func (r *MessageRepo) GetStarredMessages(userID int64) ([]map[string]interface{}, error) {
 	rows, err := r.DB.Query(`
 		SELECT m.id, m.conversation_id, m.sender_id, m.receiver_id, m.content, m.created_at,
+		       COALESCE(m.message_type,'text'),
+		       m.media_url, m.media_type,
 		       COALESCE(u_sender.full_name, '') AS sender_name,
 		       COALESCE(u_sender.profile_photo, '') AS sender_photo,
 		       COALESCE(u_receiver.full_name, '') AS receiver_name,
@@ -264,23 +266,29 @@ func (r *MessageRepo) GetStarredMessages(userID int64) ([]map[string]interface{}
 	var list []map[string]interface{}
 	for rows.Next() {
 		var id, convID, senderID, receiverID int64
-		var content, createdAt, senderName, senderPhoto, receiverName, receiverPhoto string
+		var content, createdAt, msgType, senderName, senderPhoto, receiverName, receiverPhoto string
+		var mediaURL, mediaType sql.NullString
 		if err := rows.Scan(&id, &convID, &senderID, &receiverID, &content, &createdAt,
+			&msgType, &mediaURL, &mediaType,
 			&senderName, &senderPhoto, &receiverName, &receiverPhoto); err != nil {
 			return nil, err
 		}
-		list = append(list, map[string]interface{}{
+		m := map[string]interface{}{
 			"id":              id,
 			"conversation_id": convID,
 			"sender_id":       senderID,
 			"receiver_id":     receiverID,
 			"body":            content,
 			"created_at":      createdAt,
+			"message_type":    msgType,
 			"sender_name":     senderName,
 			"sender_photo":    senderPhoto,
 			"receiver_name":   receiverName,
 			"receiver_photo":  receiverPhoto,
-		})
+		}
+		if mediaURL.Valid  { m["media_url"]  = mediaURL.String  }
+		if mediaType.Valid { m["media_type"] = mediaType.String }
+		list = append(list, m)
 	}
 	if list == nil {
 		list = []map[string]interface{}{}
