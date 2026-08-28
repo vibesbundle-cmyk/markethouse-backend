@@ -406,6 +406,7 @@ type EnrichedConversation struct {
 	OtherUserHeader     string `json:"other_user_header"`
 	LastMessage         string `json:"last_message"`
 	LastTime            string `json:"last_time"`
+	UpdatedAt           string `json:"updated_at"`
 	UnreadCount         int    `json:"unread_count"`
 	IsOnline            bool   `json:"is_online"`
 	IsPinned            bool   `json:"is_pinned"`
@@ -430,6 +431,7 @@ func (r *MessageRepo) GetConversations(userID int64) ([]EnrichedConversation, er
 			CASE WHEN c.user_one_id=$1 THEN COALESCE(u2.header_photo,'') ELSE COALESCE(u1.header_photo,'') END AS other_user_header,
 			COALESCE(c.last_message,'')                     AS last_message,
 			COALESCE(to_char(c.updated_at,'HH24:MI'),'')   AS last_time,
+			COALESCE(to_char(c.updated_at,'YYYY-MM-DD"T"HH24:MI:SS'),'') AS updated_at,
 			(SELECT COUNT(*) FROM messages m WHERE m.conversation_id=c.id AND m.receiver_id=$1 AND m.is_read=false
 			   AND m.created_at > COALESCE(CASE WHEN c.user_one_id=$1 THEN c.cleared_at_one ELSE c.cleared_at_two END, to_timestamp(0))) AS unread_count,
 			COALESCE(c.is_pinned,false),
@@ -460,7 +462,7 @@ func (r *MessageRepo) GetConversations(userID int64) ([]EnrichedConversation, er
 	for rows.Next() {
 		var c EnrichedConversation
 		if err := rows.Scan(&c.ID,&c.OtherUserID,&c.OtherUserName,&c.OtherUserPhoto,&c.OtherUserHeader,
-			&c.LastMessage,&c.LastTime,&c.UnreadCount,
+			&c.LastMessage,&c.LastTime,&c.UpdatedAt,&c.UnreadCount,
 			&c.IsPinned,&c.IsArchived,&c.CustomCategory,
 			&c.Wallpaper,&c.WallpaperColor,&c.WallpaperDim,&c.BubbleColor,&c.BubbleOpacity,
 			&c.DisappearingSeconds,&c.IsMuted); err != nil {
@@ -480,6 +482,7 @@ const enrichedConversationColumns = `
 			CASE WHEN c.user_one_id=$1 THEN COALESCE(u2.header_photo,'') ELSE COALESCE(u1.header_photo,'') END AS other_user_header,
 			COALESCE(c.last_message,'')                     AS last_message,
 			COALESCE(to_char(c.updated_at,'HH24:MI'),'')   AS last_time,
+			COALESCE(to_char(c.updated_at,'YYYY-MM-DD"T"HH24:MI:SS'),'') AS updated_at,
 			(SELECT COUNT(*) FROM messages m WHERE m.conversation_id=c.id AND m.receiver_id=$1 AND m.is_read=false
 			   AND m.created_at > COALESCE(CASE WHEN c.user_one_id=$1 THEN c.cleared_at_one ELSE c.cleared_at_two END, to_timestamp(0))) AS unread_count,
 			COALESCE(c.is_pinned,false),
@@ -504,7 +507,7 @@ func (r *MessageRepo) GetConversation(convID, userID int64) (EnrichedConversatio
 		JOIN users u2 ON u2.id=c.user_two_id
 		WHERE c.id=$2 AND (c.user_one_id=$1 OR c.user_two_id=$1)
 	`, userID, convID).Scan(&c.ID,&c.OtherUserID,&c.OtherUserName,&c.OtherUserPhoto,&c.OtherUserHeader,
-		&c.LastMessage,&c.LastTime,&c.UnreadCount,
+		&c.LastMessage,&c.LastTime,&c.UpdatedAt,&c.UnreadCount,
 		&c.IsPinned,&c.IsArchived,&c.CustomCategory,
 		&c.Wallpaper,&c.WallpaperColor,&c.WallpaperDim,&c.BubbleColor,
 		&c.DisappearingSeconds,&c.IsMuted)
