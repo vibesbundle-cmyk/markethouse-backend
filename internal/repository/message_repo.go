@@ -179,8 +179,16 @@ func (r *MessageRepo) EditMessage(userID, msgID int64, newContent string) error 
 }
 
 func (r *MessageRepo) DeleteMessage(userID, msgID int64) error {
-	_, err := r.DB.Exec(`DELETE FROM messages WHERE id=$1 AND sender_id=$2`, msgID, userID)
-	return err
+	res, err := r.DB.Exec(
+		`UPDATE messages SET content='🗑️ This message was deleted', deleted_at=NOW(), message_type='deleted'
+		 WHERE id=$1 AND sender_id=$2`, msgID, userID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 func (r *MessageRepo) GetPinnedMessages(convID int64) ([]models.Message, error) {

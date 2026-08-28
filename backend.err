@@ -1,0 +1,7 @@
+2026/08/27 14:26:34 warning: vinci.sql statement skipped: pq: column "seller_id" does not exist (42703) — CREATE INDEX IF NOT EXISTS idx_orders_seller ON orders(seller_id)
+2026/08/27 14:26:34 [DIAG] wallet_transactions has wallet_id: true
+2026/08/27 14:26:35 ✓ Upload directories initialized
+2026/08/27 14:26:35 ✓ Using local disk for uploads (set CLOUDINARY_* to switch)
+2026/08/27 14:26:35 ✓ Delivery-breach cron scheduled (every 15m)
+2026/08/27 14:26:35 ✓ Scheduled-transfer cron scheduled (every 1m)
+exit status 0xffffffff

@@ -329,6 +329,7 @@ func runSelfHealingMigrations(db *sql.DB) error {
 		// location-share messages (message_type='location') carry a point
 		`ALTER TABLE messages ADD COLUMN IF NOT EXISTS latitude  DOUBLE PRECISION`,
 		`ALTER TABLE messages ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION`,
+		`ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP`,
 		// conversation settings
 		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS is_pinned            BOOLEAN DEFAULT false`,
 		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS is_archived          BOOLEAN DEFAULT false`,
