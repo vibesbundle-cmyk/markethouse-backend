@@ -220,16 +220,17 @@ func (r *MessageRepo) GetPinnedMessages(convID int64) ([]models.Message, error) 
 	return list, nil
 }
 
-func (r *MessageRepo) GetStarredMessages(userID int64) ([]models.Message, error) {
+func (r *MessageRepo) GetStarredMessages(userID int64) ([]map[string]interface{}, error) {
 	rows, err := r.DB.Query(`
-		SELECT m.id, m.sender_id, m.receiver_id, m.content, m.is_read, m.created_at,
-		       COALESCE(m.message_type,'text'),
-		       m.media_url, m.media_type, m.reply_to_id,
-		       COALESCE(m.is_starred,false), COALESCE(m.is_pinned,false),
-		       m.reaction, COALESCE(m.is_edited,false), m.expires_at,
-		       m.latitude, m.longitude
+		SELECT m.id, m.conversation_id, m.sender_id, m.receiver_id, m.content, m.created_at,
+		       COALESCE(u_sender.full_name, '') AS sender_name,
+		       COALESCE(u_sender.profile_photo, '') AS sender_photo,
+		       COALESCE(u_receiver.full_name, '') AS receiver_name,
+		       COALESCE(u_receiver.profile_photo, '') AS receiver_photo
 		FROM messages m
 		JOIN conversations c ON c.id = m.conversation_id
+		LEFT JOIN users u_sender ON u_sender.id = m.sender_id
+		LEFT JOIN users u_receiver ON u_receiver.id = m.receiver_id
 		WHERE m.is_starred = true
 		  AND (m.sender_id = $1 OR m.receiver_id = $1)
 		  AND (c.user_one_id = $1 OR c.user_two_id = $1)
@@ -239,29 +240,29 @@ func (r *MessageRepo) GetStarredMessages(userID int64) ([]models.Message, error)
 		return nil, err
 	}
 	defer rows.Close()
-	var list []models.Message
+	var list []map[string]interface{}
 	for rows.Next() {
-		var m models.Message
-		var mediaURL, mediaType, reaction sql.NullString
-		var replyToID sql.NullInt64
-		var expiresAt sql.NullTime
-		var lat, lng sql.NullFloat64
-		if err := rows.Scan(&m.ID, &m.SenderID, &m.ReceiverID, &m.Content,
-			&m.IsRead, &m.CreatedAt, &m.MessageType,
-			&mediaURL, &mediaType, &replyToID,
-			&m.IsStarred, &m.IsPinned, &reaction,
-			&m.IsEdited, &expiresAt, &lat, &lng); err != nil {
+		var id, convID, senderID, receiverID int64
+		var content, createdAt, senderName, senderPhoto, receiverName, receiverPhoto string
+		if err := rows.Scan(&id, &convID, &senderID, &receiverID, &content, &createdAt,
+			&senderName, &senderPhoto, &receiverName, &receiverPhoto); err != nil {
 			return nil, err
 		}
-		m.ConversationID = 0 // not relevant for starred list
-		if mediaURL.Valid  { m.MediaURL  = &mediaURL.String  }
-		if mediaType.Valid { m.MediaType = &mediaType.String  }
-		if replyToID.Valid { v := replyToID.Int64; m.ReplyToID = &v }
-		if reaction.Valid  { m.Reaction  = &reaction.String  }
-		if expiresAt.Valid { t := expiresAt.Time; m.ExpiresAt = &t }
-		if lat.Valid       { m.Latitude  = &lat.Float64  }
-		if lng.Valid       { m.Longitude = &lng.Float64  }
-		list = append(list, m)
+		list = append(list, map[string]interface{}{
+			"id":              id,
+			"conversation_id": convID,
+			"sender_id":       senderID,
+			"receiver_id":     receiverID,
+			"body":            content,
+			"created_at":      createdAt,
+			"sender_name":     senderName,
+			"sender_photo":    senderPhoto,
+			"receiver_name":   receiverName,
+			"receiver_photo":  receiverPhoto,
+		})
+	}
+	if list == nil {
+		list = []map[string]interface{}{}
 	}
 	return list, nil
 }
