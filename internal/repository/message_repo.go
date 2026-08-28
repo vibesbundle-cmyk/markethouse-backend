@@ -267,6 +267,54 @@ func (r *MessageRepo) GetStarredMessages(userID int64) ([]map[string]interface{}
 	return list, nil
 }
 
+func (r *MessageRepo) SearchMessages(userID int64, query string) ([]map[string]interface{}, error) {
+	like := "%" + query + "%"
+	rows, err := r.DB.Query(`
+		SELECT m.id, m.conversation_id, m.sender_id, m.receiver_id, m.content, m.created_at,
+		       COALESCE(u_sender.full_name, '') AS sender_name,
+		       COALESCE(u_sender.profile_photo, '') AS sender_photo,
+		       COALESCE(u_receiver.full_name, '') AS receiver_name,
+		       COALESCE(u_receiver.profile_photo, '') AS receiver_photo
+		FROM messages m
+		JOIN conversations c ON c.id = m.conversation_id
+		LEFT JOIN users u_sender ON u_sender.id = m.sender_id
+		LEFT JOIN users u_receiver ON u_receiver.id = m.receiver_id
+		WHERE (m.sender_id = $1 OR m.receiver_id = $1)
+		  AND (c.user_one_id = $1 OR c.user_two_id = $1)
+		  AND m.content ILIKE $2
+		ORDER BY m.created_at DESC
+		LIMIT 100`, userID, like)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var list []map[string]interface{}
+	for rows.Next() {
+		var id, convID, senderID, receiverID int64
+		var content, createdAt, senderName, senderPhoto, receiverName, receiverPhoto string
+		if err := rows.Scan(&id, &convID, &senderID, &receiverID, &content, &createdAt,
+			&senderName, &senderPhoto, &receiverName, &receiverPhoto); err != nil {
+			return nil, err
+		}
+		list = append(list, map[string]interface{}{
+			"id":              id,
+			"conversation_id": convID,
+			"sender_id":       senderID,
+			"receiver_id":     receiverID,
+			"body":            content,
+			"created_at":      createdAt,
+			"sender_name":     senderName,
+			"sender_photo":    senderPhoto,
+			"receiver_name":   receiverName,
+			"receiver_photo":  receiverPhoto,
+		})
+	}
+	if list == nil {
+		list = []map[string]interface{}{}
+	}
+	return list, nil
+}
+
 // MarkMessagesRead flags every unread message the user received in this
 // conversation as read. Called when they load the chat history.
 func (r *MessageRepo) MarkMessagesRead(convID, userID int64) error {

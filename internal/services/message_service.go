@@ -140,6 +140,9 @@ func (s *MessageService) GetPinnedMessages(convID int64) ([]models.Message, erro
 func (s *MessageService) GetStarredMessages(userID int64) ([]map[string]interface{}, error) {
 	return s.Repo.GetStarredMessages(userID)
 }
+func (s *MessageService) SearchMessages(userID int64, query string) ([]map[string]interface{}, error) {
+	return s.Repo.SearchMessages(userID, query)
+}
 func (s *MessageService) UpdateConversationSettings(convID int64, settings map[string]interface{}) error {
 	return s.Repo.UpdateConversationSettings(convID, settings)
 }

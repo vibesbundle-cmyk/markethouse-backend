@@ -246,6 +246,7 @@ func SetupRouter(
 	auth.GET("/messages/:conv_id/pinned", messageHandler.GetPinnedMessages)
 	auth.POST("/message/:msg_id/star", messageHandler.StarMessage)
 	auth.GET("/messages/starred", messageHandler.GetStarredMessages)
+	auth.GET("/messages/search", messageHandler.SearchMessages)
 	auth.POST("/message/:msg_id/pin", messageHandler.PinMessage)
 	auth.POST("/message/:msg_id/react", messageHandler.ReactMessage)
 	auth.PUT("/message/:msg_id", messageHandler.EditMessage)

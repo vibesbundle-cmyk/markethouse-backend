@@ -202,3 +202,18 @@ func (h *MessageHandler) UpdateConversationSettings(c *gin.Context) {
 	}
 	c.JSON(200, gin.H{"ok": true, "conversation": conv})
 }
+
+func (h *MessageHandler) SearchMessages(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	q := c.Query("q")
+	if q == "" {
+		c.JSON(200, gin.H{"messages": []map[string]interface{}{}})
+		return
+	}
+	msgs, err := h.Service.SearchMessages(userID, q)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"messages": msgs})
+}
