@@ -213,12 +213,28 @@ func (h *InteractionHandler) Reshare(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid post ID"})
 		return
 	}
-	if err := h.Service.Reshare(userID, postID); err != nil {
+	// Users can't reshare their own posts.
+	var author int64
+	if err := h.DB.QueryRow(`SELECT user_id FROM posts WHERE id=$1`, postID).Scan(&author); err != nil {
+		c.JSON(404, gin.H{"error": "post not found"})
+		return
+	}
+	if author == userID {
+		c.JSON(400, gin.H{"error": "you can't reshare your own post"})
+		return
+	}
+	inserted, err := h.Service.Reshare(userID, postID)
+	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
-	var author int64
-	if h.DB.QueryRow(`SELECT user_id FROM posts WHERE id=$1`, postID).Scan(&author) == nil {
+	// Only notify + broadcast when a brand-new reshare happened — a repeat
+	// tap on a post the user already reshared must not bump the count again.
+	if !inserted {
+		c.JSON(200, gin.H{"message": "already reshared"})
+		return
+	}
+	if author > 0 {
 		NotifyWithWS(h.DB, h.Hub, author, userID, "reshare",
 			userName(h.DB, userID)+" reshared your post", "", "post", postID)
 	}

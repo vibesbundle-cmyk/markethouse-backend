@@ -32,6 +32,7 @@ func SetupRouter(
 	signalHandler *handlers.SignalHandler,
 	supplyDemandHandler *handlers.SupplyDemandHandler,
 	contactHandler *handlers.ContactHandler,
+	searchHandler *handlers.SearchHandler,
 ) *gin.Engine {
 
 	r := gin.New()
@@ -75,6 +76,22 @@ func SetupRouter(
 
 	// Public shop
 	r.GET("/shop/products", shopHandler.PublicProducts)
+
+	// ═══════════════════════════════════════════════════════════════
+	// BROWSE ROUTES (auth optional — guests can read, viewers are applied
+	// when a token is present, user_id = 0 otherwise). Must be registered
+	// BEFORE the protected group so anonymous requests don't hit the strict
+	// JWT middleware.
+	// ═══════════════════════════════════════════════════════════════
+	browse := r.Group("/")
+	browse.Use(middleware.OptionalAuthMiddleware())
+
+	browse.GET("/commerce", commerceHandler.List)
+	browse.GET("/communities", communityHandler.List)
+	browse.GET("/communities/:slug", communityHandler.Get)
+	browse.GET("/community/id/:id", communityHandler.GetByID)
+	browse.GET("/community/:id/posts", communityHandler.GetPosts)
+	browse.GET("/community/post/:post_id", communityHandler.GetPost)
 
 	// ═══════════════════════════════════════════════════════════════
 	// PROTECTED ROUTES
@@ -125,6 +142,8 @@ func SetupRouter(
 	auth.GET("/feed/nearby", signalHandler.NearbyFeed)
 	auth.GET("/nearby/users", signalHandler.NearbyUsers)
 	auth.GET("/interests", signalHandler.GetInterests)
+	auth.GET("/user/interests", signalHandler.GetExplicitInterests)
+	auth.POST("/user/interests", signalHandler.SetExplicitInterests)
 	auth.GET("/analytics/post/:post_id", signalHandler.PostAnalytics)
 	auth.GET("/analytics/profile", signalHandler.CreatorAnalytics)
 	auth.GET("/analytics/business", signalHandler.BusinessAnalytics)
@@ -178,65 +197,14 @@ func SetupRouter(
 	auth.GET("/wallet/schedule", shopHandler.ListScheduled)
 
 	// ── GLOBAL SEARCH ──────────────────────────────────────────────
-	auth.GET("/search", func(c *gin.Context) {
-		q := c.Query("q")
-		if q == "" {
-			c.JSON(400, gin.H{"error": "q required"})
-			return
-		}
-		db := communityHandler.DB
-
-		var people []gin.H
-		rows, _ := db.Query(`SELECT id,username,full_name,COALESCE(profile_photo,''),account_type FROM users
-			WHERE username ILIKE $1 OR full_name ILIKE $1 LIMIT 10`, "%"+q+"%")
-		if rows != nil {
-			defer rows.Close()
-			for rows.Next() {
-				var id int64
-				var uname, fn, photo, at string
-				rows.Scan(&id, &uname, &fn, &photo, &at)
-				people = append(people, gin.H{"id": id, "username": uname, "full_name": fn, "profile_photo": photo, "account_type": at})
-			}
-		}
-
-		var communities []gin.H
-		rows2, _ := db.Query(`SELECT id,name,slug,COALESCE(description,''),COALESCE(cover_photo,''),COALESCE(icon,''),member_count,COALESCE(category,'')
-			FROM communities WHERE name ILIKE $1 OR description ILIKE $1 LIMIT 10`, "%"+q+"%")
-		if rows2 != nil {
-			defer rows2.Close()
-			for rows2.Next() {
-				var id, mc int64
-				var name, slug, desc, cover, icon, cat string
-				rows2.Scan(&id, &name, &slug, &desc, &cover, &icon, &mc, &cat)
-				communities = append(communities, gin.H{"id": id, "name": name, "slug": slug, "description": desc, "cover_photo": cover, "icon": icon, "member_count": mc, "category": cat})
-			}
-		}
-
-		var posts []gin.H
-		rows3, _ := db.Query(`SELECT p.id,p.caption,COALESCE(p.media_url,''),p.created_at,u.username,COALESCE(u.profile_photo,'')
-			FROM posts p JOIN users u ON u.id=p.user_id
-			WHERE p.caption ILIKE $1 LIMIT 10`, "%"+q+"%")
-		if rows3 != nil {
-			defer rows3.Close()
-			for rows3.Next() {
-				var id int64
-				var cap, media, ca, uname, photo string
-				rows3.Scan(&id, &cap, &media, &ca, &uname, &photo)
-				posts = append(posts, gin.H{"id": id, "caption": cap, "media_url": media, "created_at": ca, "username": uname, "profile_photo": photo})
-			}
-		}
-
-		if people == nil {
-			people = []gin.H{}
-		}
-		if communities == nil {
-			communities = []gin.H{}
-		}
-		if posts == nil {
-			posts = []gin.H{}
-		}
-		c.JSON(200, gin.H{"people": people, "communities": communities, "posts": posts})
-	})
+	auth.GET("/search", searchHandler.Search)
+	auth.GET("/search/autocomplete", searchHandler.Autocomplete)
+	auth.GET("/search/posts", searchHandler.SearchPosts)
+	auth.GET("/search/users", searchHandler.SearchUsers)
+	auth.GET("/search/marketplace", searchHandler.SearchMarketplace)
+	auth.GET("/search/communities", searchHandler.SearchCommunities)
+	auth.GET("/search/trending", searchHandler.Trending)
+	auth.GET("/search/popular", searchHandler.Popular)
 
 	// ── MESSAGING ─────────────────────────────────────────────────
 	auth.POST("/message/send", messageHandler.SendMessage)
@@ -256,6 +224,10 @@ func SetupRouter(
  auth.POST("/conversation/:conv_id/hide", messageHandler.HideConversation)
  auth.POST("/conversation/:conv_id/purge", messageHandler.PurgeConversation)
 
+	// ── CALL LOGS ──────────────────────────────────────────────────
+	auth.POST("/call/log", messageHandler.LogCall)
+	auth.GET("/call/logs", messageHandler.GetCallLogs)
+
 	// ── REAL-TIME ─────────────────────────────────────────────────
 	// WebSocket needs custom auth handling for query param tokens
 	auth.GET("/ws", func(c *gin.Context) {
@@ -273,17 +245,20 @@ func SetupRouter(
 	})
 
 	// ── COMMUNITY ─────────────────────────────────────────────────
-	auth.GET("/communities", communityHandler.List)
-	auth.GET("/communities/:slug", communityHandler.Get)
-
-	// ── COMMERCE (MARKETPLACE LISTINGS) ────────────────────────────
-	auth.GET("/commerce", commerceHandler.List)
-	auth.GET("/commerce/mine", commerceHandler.GetMine)
+	auth.POST("/community", communityHandler.Create)
 	auth.POST("/commerce/listing", commerceHandler.Create)
+	auth.GET("/commerce/mine", commerceHandler.GetMine)
+	auth.DELETE("/commerce/:id", commerceHandler.Delete)
 	auth.POST("/commerce/:id/vote", commerceHandler.Vote)
 	auth.POST("/commerce/:id/report", commerceHandler.Report)
 	auth.GET("/admin/commerce-reports", commerceHandler.ListReports)
 	auth.PUT("/admin/commerce-reports/:id", commerceHandler.ResolveReport)
+	// Commerce listing comments
+	auth.GET("/commerce/:id/comments", commerceHandler.GetComments)
+	auth.POST("/commerce/:id/comment", commerceHandler.AddComment)
+	auth.POST("/commerce-comment/:id/like", commerceHandler.LikeComment)
+	auth.DELETE("/commerce-comment/:id/like", commerceHandler.UnlikeComment)
+	auth.DELETE("/commerce-comment/:id", commerceHandler.DeleteComment)
 
 	// ---- Supply & Demand (thrift marketplace) ----
 	auth.GET("/supply-demand", supplyDemandHandler.GetListings)
@@ -291,6 +266,7 @@ func SetupRouter(
 	auth.PUT("/supply-demand/:id", supplyDemandHandler.UpdateListing)
 	auth.DELETE("/supply-demand/:id", supplyDemandHandler.DeleteListing)
 	auth.POST("/supply-demand/:id/interest", supplyDemandHandler.ExpressInterest)
+	auth.POST("/supply-demand/:id/cart", shopHandler.AddSdToCart)
 	auth.GET("/supply-demand/mine", supplyDemandHandler.GetMyListings)
 	auth.POST("/supply-demand/ask-around", supplyDemandHandler.PostAskAround)
 	auth.GET("/supply-demand/nearby-suppliers", supplyDemandHandler.GetNearbySuppliers)
@@ -301,18 +277,29 @@ func SetupRouter(
 	auth.PUT("/admin/settings", supplyDemandHandler.UpdateSettings)
 	auth.POST("/community", communityHandler.Create)
 	// Routes with explicit path segments (most specific) come before wildcard routes
-	auth.GET("/community/id/:id", communityHandler.GetByID)
 	auth.POST("/community/:id/join", communityHandler.Join)
 	auth.DELETE("/community/:id/leave", communityHandler.Leave)
 	auth.DELETE("/community/:id", communityHandler.Delete)
-	auth.GET("/community/:id/posts", communityHandler.GetPosts)
 	auth.GET("/community/:id/members", communityHandler.GetMembers)
 	auth.POST("/community/:id/role", communityHandler.AssignRole)
+	auth.POST("/community/:id/add-member", communityHandler.AddMember)
 	auth.POST("/community/:id/post", communityHandler.CreatePost)
 	auth.PUT("/community/:id/settings", communityHandler.UpdateSettings)
 	auth.POST("/community/:id/ban", communityHandler.BanMember)
 	auth.POST("/community/:id/mute", communityHandler.MuteMember)
+	auth.GET("/community/:id/admins", communityHandler.GetAdmins)
+	auth.POST("/community/:id/admins", communityHandler.AddAdmin)
+	auth.DELETE("/community/:id/admins/:userId", communityHandler.RemoveAdmin)
+	auth.POST("/community/:id/owners", communityHandler.AddOwner)
+	auth.GET("/community/:id/join-settings", communityHandler.GetJoinSettings)
+	auth.PUT("/community/:id/join-settings", communityHandler.UpdateJoinSettings)
+	auth.GET("/community/:id/join-requests", communityHandler.GetJoinRequests)
+	auth.POST("/community/:id/join-requests/:reqId/approve", communityHandler.ApproveJoinRequest)
+	auth.POST("/community/:id/join-requests/:reqId/decline", communityHandler.DeclineJoinRequest)
+	auth.GET("/community/:id/tag-settings", communityHandler.GetTagSettings)
+	auth.PUT("/community/:id/tag-settings", communityHandler.UpdateTagSettings)
 	auth.GET("/community/:id/messages", communityHandler.GetMessages)
+	auth.POST("/community/:id/read", communityHandler.MarkRead)
 	auth.POST("/community/:id/messages", communityHandler.SendMessage)
 	auth.PUT("/community/:id/messages/:mid", communityHandler.EditMessage)
 	auth.DELETE("/community/:id/messages/:mid", communityHandler.DeleteMessage)
@@ -331,6 +318,8 @@ func SetupRouter(
 	// Post-related routes (explicit "post" segment)
 	auth.POST("/community/post/:post_id/vote", communityHandler.Vote)
 	auth.POST("/community/post/:post_id/poll/vote", communityHandler.VotePoll)
+	auth.POST("/community/post/:post_id/poll/option", communityHandler.AddPollOption)
+	auth.POST("/community/post/:post_id/edit", communityHandler.EditPost)
 	auth.POST("/community/post/:post_id/comment/:comment_id/best", communityHandler.MarkBestAnswer)
 	auth.POST("/community/comment/:comment_id/like", communityHandler.LikeComment)
 	auth.DELETE("/community/comment/:comment_id/like", communityHandler.UnlikeComment)
@@ -339,6 +328,7 @@ func SetupRouter(
 	auth.DELETE("/community/post/:post_id", communityHandler.DeletePost)
 	auth.GET("/community/post/:post_id/comments", communityHandler.GetComments)
 	auth.POST("/community/post/:post_id/comment", communityHandler.AddComment)
+	auth.GET("/community/post/:post_id/poll/option/:option_id/voters", communityHandler.GetPollVoters)
 
 	// ── STATUS ────────────────────────────────────────────────────
 	auth.GET("/statuses", statusHandler.GetFeed)

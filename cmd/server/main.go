@@ -194,8 +194,12 @@ func main() {
 	contactService := &services.ContactService{Repo: contactRepo}
 	contactHandler := &handlers.ContactHandler{Service: contactService}
 
+	// ---------------- SEARCH ----------------
+	searchService := services.NewSearchService(db, redisClient)
+	searchHandler := &handlers.SearchHandler{Service: searchService}
+
 	// ---------------- ROUTES ----------------
-	r := routes.SetupRouter(authHandler, postHandler, followHandler, interactionHandler, messageHandler, wsHandler, marketHandler, shopHandler, communityHandler, statusHandler, notifHandler, commerceHandler, signalHandler, supplyDemandHandler, contactHandler)
+	r := routes.SetupRouter(authHandler, postHandler, followHandler, interactionHandler, messageHandler, wsHandler, marketHandler, shopHandler, communityHandler, statusHandler, notifHandler, commerceHandler, signalHandler, supplyDemandHandler, contactHandler, searchHandler)
 	r.Use(func(c *gin.Context) { c.Set("db", db); c.Next() })
 
 	// ---------------- START SERVER ----------------

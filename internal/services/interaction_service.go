@@ -33,7 +33,7 @@ func (s *InteractionService) Save(userID, postID int64) error {
 func (s *InteractionService) Unsave(userID, postID int64) error {
 	return s.Repo.Unsave(userID, postID)
 }
-func (s *InteractionService) Reshare(userID, postID int64) error {
+func (s *InteractionService) Reshare(userID, postID int64) (bool, error) {
 	return s.Repo.Reshare(userID, postID)
 }
 func (s *InteractionService) Unreshare(userID, postID int64) error {

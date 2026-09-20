@@ -22,12 +22,13 @@ func (h *StatusHandler) GetFeed(c *gin.Context) {
 	// (hide_status_credit) the username is blanked → client shows anonymous.
 	rows, err := h.DB.Query(`
 		SELECT s.id,s.user_id,s.status_type,COALESCE(s.media_url,''),COALESCE(s.text_content,''),
-		       COALESCE(s.bg_color,'#1DB954'),s.view_count,s.expires_at,s.created_at,
+		       COALESCE(s.bg_color,'#1DB954'),COALESCE(s.bg_image,''),s.view_count,s.expires_at,s.created_at,
 		       u.username,COALESCE(u.profile_photo,''),
 		       EXISTS(SELECT 1 FROM status_views sv WHERE sv.status_id=s.id AND sv.viewer_id=$1) as viewed,
 		       COALESCE(s.reshared_from_user_id,0),
 		       COALESCE(s.reshared_from_id,0),
-		       CASE WHEN COALESCE(ou.hide_status_credit,false) THEN '' ELSE COALESCE(s.reshared_from_username,'') END
+		       CASE WHEN COALESCE(ou.hide_status_credit,false) THEN '' ELSE COALESCE(s.reshared_from_username,'') END,
+		       COALESCE(s.music_title,''), COALESCE(s.music_url,'')
 		FROM statuses s JOIN users u ON u.id=s.user_id
 		LEFT JOIN users ou ON ou.id=s.reshared_from_user_id
 		WHERE s.expires_at > NOW()
@@ -45,10 +46,11 @@ func (h *StatusHandler) GetFeed(c *gin.Context) {
 	var list []gin.H
 	for rows.Next() {
 		var id, uid, vc, rfUID, rfSID int64
-		var st, mu, txt, bg, ea, ca, uname, photo, rfName string
+		var st, mu, txt, bg, bgImg, ea, ca, uname, photo, rfName string
+		var musicTitle, musicURL string
 		var viewed bool
-		rows.Scan(&id, &uid, &st, &mu, &txt, &bg, &vc, &ea, &ca, &uname, &photo, &viewed, &rfUID, &rfSID, &rfName)
-		list = append(list, gin.H{"id": id, "user_id": uid, "status_type": st, "media_url": mu, "text_content": txt, "bg_color": bg, "view_count": vc, "expires_at": ea, "created_at": ca, "username": uname, "profile_photo": photo, "viewed": viewed, "reshared_from_user_id": rfUID, "reshared_from_id": rfSID, "reshared_from_username": rfName})
+		rows.Scan(&id, &uid, &st, &mu, &txt, &bg, &bgImg, &vc, &ea, &ca, &uname, &photo, &viewed, &rfUID, &rfSID, &rfName, &musicTitle, &musicURL)
+		list = append(list, gin.H{"id": id, "user_id": uid, "status_type": st, "media_url": mu, "text_content": txt, "bg_color": bg, "bg_image": bgImg, "view_count": vc, "expires_at": ea, "created_at": ca, "username": uname, "profile_photo": photo, "viewed": viewed, "reshared_from_user_id": rfUID, "reshared_from_id": rfSID, "reshared_from_username": rfName, "music_title": musicTitle, "music_url": musicURL})
 	}
 	if list == nil {
 		list = []gin.H{}
@@ -63,9 +65,12 @@ func (h *StatusHandler) Create(c *gin.Context) {
 		MediaURL     string `json:"media_url"`
 		Text         string `json:"text_content"`
 		BgColor      string `json:"bg_color"`
+		BgImage      string `json:"bg_image"`
 		Privacy      string `json:"privacy"`
 		CustomIDs    string `json:"custom_ids"`
 		ResharedFrom int64  `json:"reshared_from"`
+		MusicTitle   string `json:"music_title"`
+		MusicURL     string `json:"music_url"`
 	}
 	c.ShouldBindJSON(&req)
 	if req.Type == "" {
@@ -94,8 +99,8 @@ func (h *StatusHandler) Create(c *gin.Context) {
 		}
 	}
 	var id int64
-	err := h.DB.QueryRow(`INSERT INTO statuses(user_id,status_type,media_url,text_content,bg_color,privacy,custom_ids,reshared_from_id,reshared_from_user_id,reshared_from_username) VALUES($1,$2,$3,$4,$5,$6,$7,NULLIF($8,0),NULLIF($9,0),$10) RETURNING id`,
-		userID, req.Type, req.MediaURL, req.Text, req.BgColor, req.Privacy, req.CustomIDs, rfID, rfUID, rfName).Scan(&id)
+	err := h.DB.QueryRow(`INSERT INTO statuses(user_id,status_type,media_url,text_content,bg_color,bg_image,privacy,custom_ids,reshared_from_id,reshared_from_user_id,reshared_from_username,music_title,music_url) VALUES($1,$2,$3,$4,$5,NULLIF($6,''),$7,$8,NULLIF($9,0),NULLIF($10,0),$11,$12,$13) RETURNING id`,
+		userID, req.Type, req.MediaURL, req.Text, req.BgColor, req.BgImage, req.Privacy, req.CustomIDs, rfID, rfUID, rfName, req.MusicTitle, req.MusicURL).Scan(&id)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return

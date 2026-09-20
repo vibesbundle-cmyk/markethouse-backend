@@ -155,7 +155,7 @@ func (h *CommerceHandler) GetMine(c *gin.Context) {
 		       COALESCE(l.sku,''), l.delivery_available, COALESCE(l.location,''), COALESCE(l.images,'{}'),
 		       COALESCE(l.video_url,''), COALESCE(l.metadata::text,'{}'), l.views, l.created_at, l.status
 		FROM commerce_listings l
-		WHERE l.user_id = $1
+		WHERE l.user_id = $1 AND l.status != 'removed'
 		ORDER BY l.created_at DESC LIMIT 200`, userID)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
@@ -283,6 +283,32 @@ func (h *CommerceHandler) Create(c *gin.Context) {
 		})
 	}
 	c.JSON(200, gin.H{"id": id})
+}
+
+// DELETE /commerce/:id — delete your own listing (soft-delete by flipping
+// status to 'removed' so it drops out of every browse/fetch query).
+func (h *CommerceHandler) Delete(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	listingID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	res, err := h.DB.Exec(`
+		UPDATE commerce_listings SET status='removed'
+		WHERE id=$1 AND user_id=$2`, listingID, userID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		c.JSON(404, gin.H{"error": "listing not found"})
+		return
+	}
+	if h.Hub != nil {
+		h.Hub.Broadcast(map[string]interface{}{
+			"type":       "listing_deleted",
+			"listing_id": listingID,
+		})
+	}
+	c.JSON(200, gin.H{"ok": true})
 }
 
 // POST /commerce/:id/vote  {"vote": 1 | -1 | 0}   (0 clears an existing vote)
@@ -416,4 +442,134 @@ func (h *CommerceHandler) ResolveReport(c *gin.Context) {
 		}
 	}
 	c.JSON(200, gin.H{"ok": true})
+}
+
+// ── Commerce listing comments ──────────────────────────────────────────────
+
+func (h *CommerceHandler) GetComments(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	listingID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(400, gin.H{"error": "invalid listing ID"})
+		return
+	}
+	rows, err := h.DB.Query(`
+		SELECT c.id, c.listing_id, c.user_id, c.content, c.parent_comment_id,
+		       COALESCE(c.created_at::text,''),
+		       COALESCE(u.username,''), COALESCE(u.profile_photo,''),
+		       COALESCE((SELECT COUNT(*) FROM commerce_comment_likes WHERE comment_id=c.id),0) AS like_count,
+		       EXISTS(SELECT 1 FROM commerce_comment_likes WHERE comment_id=c.id AND user_id=$2) AS is_liked
+		FROM commerce_listing_comments c
+		JOIN users u ON u.id = c.user_id
+		WHERE c.listing_id = $1
+		ORDER BY c.parent_comment_id NULLS FIRST, c.created_at ASC
+		LIMIT 200`, listingID, userID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+	comments := []gin.H{}
+	for rows.Next() {
+		var id, lid, uid int64
+		var content, createdAt, username, photo string
+		var parentID sql.NullInt64
+		var likeCount int
+		var isLiked bool
+		if rows.Scan(&id, &lid, &uid, &content, &parentID, &createdAt, &username, &photo, &likeCount, &isLiked) != nil {
+			continue
+		}
+		var parentIDVal *int64
+		if parentID.Valid {
+			parentIDVal = &parentID.Int64
+		}
+		comments = append(comments, gin.H{
+			"id": id, "listing_id": lid, "user_id": uid, "content": content,
+			"parent_comment_id": parentIDVal, "created_at": createdAt,
+			"username": username, "profile_photo": photo,
+			"like_count": likeCount, "is_liked": isLiked,
+		})
+	}
+	c.JSON(200, gin.H{"comments": comments})
+}
+
+func (h *CommerceHandler) AddComment(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	listingID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(400, gin.H{"error": "invalid listing ID"})
+		return
+	}
+	var req struct {
+		Content         string `json:"content"`
+		ParentCommentID *int64 `json:"parent_comment_id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Content) == "" {
+		c.JSON(400, gin.H{"error": "content is required"})
+		return
+	}
+	var id int64
+	err = h.DB.QueryRow(`INSERT INTO commerce_listing_comments
+		(listing_id, user_id, content, parent_comment_id) VALUES ($1,$2,$3,$4) RETURNING id`,
+		listingID, userID, req.Content, req.ParentCommentID).Scan(&id)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	// Notify listing owner (if not self)
+	var owner int64
+	h.DB.QueryRow(`SELECT user_id FROM commerce_listings WHERE id=$1`, listingID).Scan(&owner)
+	if owner > 0 && owner != userID {
+		var caption string
+		h.DB.QueryRow(`SELECT COALESCE(title,'') FROM commerce_listings WHERE id=$1`, listingID).Scan(&caption)
+		actor := userName(h.DB, userID)
+		NotifyWithWS(h.DB, h.Hub, owner, userID, "comment",
+			actor+" commented on your listing", "\""+caption+"\"", "commerce", listingID)
+	}
+	c.JSON(200, gin.H{"message": "comment added", "id": id})
+}
+
+func (h *CommerceHandler) LikeComment(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	commentID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(400, gin.H{"error": "invalid comment ID"})
+		return
+	}
+	_, err = h.DB.Exec(`INSERT INTO commerce_comment_likes (comment_id, user_id)
+		VALUES ($1,$2) ON CONFLICT DO NOTHING`, commentID, userID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"message": "liked"})
+}
+
+func (h *CommerceHandler) UnlikeComment(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	commentID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(400, gin.H{"error": "invalid comment ID"})
+		return
+	}
+	h.DB.Exec(`DELETE FROM commerce_comment_likes WHERE comment_id=$1 AND user_id=$2`, commentID, userID)
+	c.JSON(200, gin.H{"message": "unliked"})
+}
+
+func (h *CommerceHandler) DeleteComment(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	commentID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(400, gin.H{"error": "invalid comment ID"})
+		return
+	}
+	// Only own comments can be deleted
+	var owner int64
+	h.DB.QueryRow(`SELECT user_id FROM commerce_listing_comments WHERE id=$1`, commentID).Scan(&owner)
+	if owner != userID {
+		c.JSON(403, gin.H{"error": "not your comment"})
+		return
+	}
+	h.DB.Exec(`DELETE FROM commerce_listing_comments WHERE id=$1`, commentID)
+	c.JSON(200, gin.H{"message": "deleted"})
 }

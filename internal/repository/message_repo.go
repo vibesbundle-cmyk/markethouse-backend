@@ -3,8 +3,10 @@ package repository
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"markethouse/internal/models"
+	"strings"
 )
 
 type MessageRepo struct {
@@ -28,12 +30,12 @@ func (r *MessageRepo) GetOrCreateConversation(userOne, userTwo int64) (int64, er
 func (r *MessageRepo) CreateMessage(msg *models.Message) error {
 	err := r.DB.QueryRow(`
 		INSERT INTO messages
-			(conversation_id, sender_id, receiver_id, content, message_type, media_url, media_type, reply_to_id, latitude, longitude)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+			(conversation_id, sender_id, receiver_id, content, message_type, media_url, media_type, reply_to_id, latitude, longitude, is_forwarded, expires_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 		RETURNING id, created_at`,
 		msg.ConversationID, msg.SenderID, msg.ReceiverID, msg.Content,
 		msg.MessageType, msg.MediaURL, msg.MediaType, msg.ReplyToID,
-		msg.Latitude, msg.Longitude,
+		msg.Latitude, msg.Longitude, msg.IsForwarded, msg.ExpiresAt,
 	).Scan(&msg.ID, &msg.CreatedAt)
 	if err == nil {
 		snippet := r.snippetFor(msg)
@@ -116,7 +118,7 @@ func (r *MessageRepo) GetMessages(convID, userID int64, limit int) ([]models.Mes
 			m.media_url, m.media_type, m.reply_to_id,
 			COALESCE(m.is_starred,false), COALESCE(m.is_pinned,false),
 			m.reaction, COALESCE(m.is_edited,false), m.expires_at,
-			m.latitude, m.longitude
+			m.latitude, m.longitude, COALESCE(m.is_forwarded,false)
 		FROM messages m
 		JOIN conversations c ON c.id = m.conversation_id
 		WHERE m.conversation_id = $1
@@ -141,7 +143,7 @@ func (r *MessageRepo) GetMessages(convID, userID int64, limit int) ([]models.Mes
 			&m.IsRead, &m.CreatedAt, &m.MessageType,
 			&mediaURL, &mediaType, &replyToID,
 			&m.IsStarred, &m.IsPinned, &reaction,
-			&m.IsEdited, &expiresAt, &lat, &lng); err != nil {
+			&m.IsEdited, &expiresAt, &lat, &lng, &m.IsForwarded); err != nil {
 			return nil, err
 		}
 		if mediaURL.Valid  { m.MediaURL  = &mediaURL.String  }
@@ -153,7 +155,64 @@ func (r *MessageRepo) GetMessages(convID, userID int64, limit int) ([]models.Mes
 		if lng.Valid       { m.Longitude = &lng.Float64  }
 		list = append(list, m)
 	}
+	if len(list) > 0 {
+		ids := make([]int64, 0, len(list))
+		for _, m := range list {
+			ids = append(ids, m.ID)
+		}
+		sum := r.ReactionsSummary(ids, userID)
+		for i := range list {
+			list[i].Reactions = sum[list[i].ID]
+		}
+	}
 	return list, nil
+}
+
+// ReactionsSummary groups raw DM reaction rows into per-emoji chips:
+// [{emoji, count, mine}] for the given message ids, from caller's view.
+func (r *MessageRepo) ReactionsSummary(msgIDs []int64, callerID int64) map[int64][]map[string]interface{} {
+	out := map[int64][]map[string]interface{}{}
+	if len(msgIDs) == 0 {
+		return out
+	}
+	ph := make([]string, len(msgIDs))
+	args := make([]interface{}, 0, len(msgIDs)+1)
+	args = append(args, callerID)
+	for i, id := range msgIDs {
+		args = append(args, id)
+		ph[i] = fmt.Sprintf("$%d", i+2)
+	}
+	query := fmt.Sprintf(`SELECT message_id, emoji, COUNT(*), BOOL_OR(user_id=$1)
+		FROM message_reactions WHERE message_id IN (%s)
+		GROUP BY message_id, emoji ORDER BY MIN(id)`, strings.Join(ph, ","))
+	rows, err := r.DB.Query(query, args...)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var mid int64
+		var emoji string
+		var cnt int
+		var mine bool
+		if rows.Scan(&mid, &emoji, &cnt, &mine) != nil {
+			continue
+		}
+		out[mid] = append(out[mid], map[string]interface{}{
+			"emoji": emoji, "count": cnt, "mine": mine,
+		})
+	}
+	return out
+}
+
+// GetMessageConversationID looks up a message's conversation + both
+// participants (used for realtime reaction broadcasts).
+func (r *MessageRepo) GetMessageConversationID(msgID int64) (int64, int64, int64, error) {
+	var cid, u1, u2 int64
+	err := r.DB.QueryRow(`SELECT m.conversation_id, c.user_one_id, c.user_two_id
+		FROM messages m JOIN conversations c ON c.id = m.conversation_id
+		WHERE m.id=$1`, msgID).Scan(&cid, &u1, &u2)
+	return cid, u1, u2, err
 }
 
 func (r *MessageRepo) StarMessage(msgID int64, star bool) error {
@@ -166,9 +225,36 @@ func (r *MessageRepo) PinMessage(msgID int64, pin bool) error {
 	return err
 }
 
-func (r *MessageRepo) ReactMessage(msgID int64, reaction string) error {
-	_, err := r.DB.Exec(`UPDATE messages SET reaction=$1 WHERE id=$2`, reaction, msgID)
-	return err
+// ReactMessage toggles the caller's emoji on a private message — one reaction
+// per person (like community chat). Returns the fresh chip list for the
+// message from the caller's point of view.
+func (r *MessageRepo) ReactMessage(userID, msgID int64, emoji string) ([]map[string]interface{}, error) {
+	if len([]rune(emoji)) == 0 || len([]rune(emoji)) > 8 {
+		return nil, errors.New("invalid emoji")
+	}
+	var existing int
+	err := r.DB.QueryRow(`SELECT COUNT(*) FROM message_reactions
+		WHERE message_id=$1 AND user_id=$2 AND emoji=$3`, msgID, userID, emoji).Scan(&existing)
+	if err != nil {
+		return nil, err
+	}
+	if existing > 0 {
+		// Tapping your own reaction removes it.
+		_, err = r.DB.Exec(`DELETE FROM message_reactions
+			WHERE message_id=$1 AND user_id=$2 AND emoji=$3`, msgID, userID, emoji)
+	} else {
+		// One reaction per person — swap to the new emoji.
+		_, err = r.DB.Exec(`DELETE FROM message_reactions
+			WHERE message_id=$1 AND user_id=$2`, msgID, userID)
+		if err == nil {
+			_, err = r.DB.Exec(`INSERT INTO message_reactions(message_id,user_id,emoji)
+				VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, msgID, userID, emoji)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return r.ReactionsSummary([]int64{msgID}, userID)[msgID], nil
 }
 
 func (r *MessageRepo) EditMessage(userID, msgID int64, newContent string) error {
@@ -311,6 +397,10 @@ func (r *MessageRepo) SearchMessages(userID int64, query string) ([]map[string]i
 		WHERE (m.sender_id = $1 OR m.receiver_id = $1)
 		  AND (c.user_one_id = $1 OR c.user_two_id = $1)
 		  AND m.content ILIKE $2
+		  AND m.message_type != 'deleted'
+		  AND m.created_at > COALESCE(
+		        CASE WHEN c.user_one_id=$1 THEN c.cleared_at_one ELSE c.cleared_at_two END,
+		        to_timestamp(0))
 		ORDER BY m.created_at DESC
 		LIMIT 100`, userID, like)
 	if err != nil {
@@ -390,8 +480,30 @@ func (r *MessageRepo) HideConversation(convID, userID int64) error {
 	return nil
 }
 
-func (r *MessageRepo) UpdateConversationSettings(convID int64, settings map[string]interface{}) error {
+func (r *MessageRepo) UpdateConversationSettings(convID, userID int64, settings map[string]interface{}) error {
+	// Determine which side of the pair this user is, so personal flags
+	// (archive, mute, pinned, wallpaper…) land on their row, not the
+	// other person's. Only the user who archives sees it under Archived.
+	var one, two int64
+	if err := r.DB.QueryRow(
+		`SELECT user_one_id, user_two_id FROM conversations WHERE id=$1 AND ($2 IN (user_one_id, user_two_id))`,
+		convID, userID).Scan(&one, &two); err != nil {
+		return err
+	}
+	archivedCol := "archived_at_two"
+	if one == userID {
+		archivedCol = "archived_at_one"
+	}
 	for k, v := range settings {
+		if k == "is_archived" {
+			// Per-user archive. NULL when unarchived, NOW() when archived.
+			if b, ok := v.(bool); ok && b {
+				r.DB.Exec(`UPDATE conversations SET `+archivedCol+`=NOW() WHERE id=$1`, convID)
+			} else {
+				r.DB.Exec(`UPDATE conversations SET `+archivedCol+`=NULL WHERE id=$1`, convID)
+			}
+			continue
+		}
 		r.DB.Exec(`UPDATE conversations SET `+k+`=$1 WHERE id=$2`, v, convID)
 	}
 	return nil
@@ -435,7 +547,7 @@ func (r *MessageRepo) GetConversations(userID int64) ([]EnrichedConversation, er
 			(SELECT COUNT(*) FROM messages m WHERE m.conversation_id=c.id AND m.receiver_id=$1 AND m.is_read=false
 			   AND m.created_at > COALESCE(CASE WHEN c.user_one_id=$1 THEN c.cleared_at_one ELSE c.cleared_at_two END, to_timestamp(0))) AS unread_count,
 			COALESCE(c.is_pinned,false),
-			COALESCE(c.is_archived,false),
+			(CASE WHEN c.user_one_id=$1 THEN c.archived_at_one ELSE c.archived_at_two END IS NOT NULL),
 			COALESCE(c.custom_category,''),
 			COALESCE(c.wallpaper,''),
 			COALESCE(c.wallpaper_color,''),
@@ -486,7 +598,7 @@ const enrichedConversationColumns = `
 			(SELECT COUNT(*) FROM messages m WHERE m.conversation_id=c.id AND m.receiver_id=$1 AND m.is_read=false
 			   AND m.created_at > COALESCE(CASE WHEN c.user_one_id=$1 THEN c.cleared_at_one ELSE c.cleared_at_two END, to_timestamp(0))) AS unread_count,
 			COALESCE(c.is_pinned,false),
-			COALESCE(c.is_archived,false),
+			(CASE WHEN c.user_one_id=$1 THEN c.archived_at_one ELSE c.archived_at_two END IS NOT NULL),
 			COALESCE(c.custom_category,''),
 			COALESCE(c.wallpaper,''),
 			COALESCE(c.wallpaper_color,''),
@@ -518,6 +630,63 @@ func (r *MessageRepo) GetConversation(convID, userID int64) (EnrichedConversatio
 // all message rows are deleted (their media URLs are returned so the caller
 // can remove the files), the preview resets, and the chat drops off both
 // chat lists until someone messages again — then it starts completely fresh.
+// LogCall inserts a call record into the call_logs table.
+func (r *MessageRepo) LogCall(senderID, receiverID int64, callType string, duration int, endedBy string) error {
+	_, err := r.DB.Exec(`
+		INSERT INTO call_logs (caller_id, receiver_id, call_type, duration, ended_by)
+		VALUES ($1, $2, $3, $4, $5)`,
+		senderID, receiverID, callType, duration, endedBy)
+	return err
+}
+
+// GetCallLogs returns the most recent 50 calls for a user, with the other
+// participant's name, username, and profile photo resolved from the users table.
+func (r *MessageRepo) GetCallLogs(userID int64) ([]map[string]interface{}, error) {
+	rows, err := r.DB.Query(`
+		SELECT cl.id,
+			CASE WHEN cl.caller_id = $1 THEN cl.receiver_id ELSE cl.caller_id END AS other_user_id,
+			CASE WHEN cl.caller_id = $1 THEN COALESCE(u.full_name,'') ELSE COALESCE(u2.full_name,'') END AS other_name,
+			CASE WHEN cl.caller_id = $1 THEN COALESCE(u.username,'') ELSE COALESCE(u2.username,'') END AS other_username,
+			CASE WHEN cl.caller_id = $1 THEN COALESCE(u.profile_photo,'') ELSE COALESCE(u2.profile_photo,'') END AS other_photo,
+			cl.call_type, cl.duration, cl.ended_by, cl.created_at
+		FROM call_logs cl
+		JOIN users u ON u.id = cl.caller_id
+		JOIN users u2 ON u2.id = cl.receiver_id
+		WHERE cl.caller_id = $1 OR cl.receiver_id = $1
+		ORDER BY cl.created_at DESC
+		LIMIT 50`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var list []map[string]interface{}
+	for rows.Next() {
+		var id, otherID int64
+		var otherName, otherUsername, otherPhoto, callType, endedBy string
+		var duration int
+		var createdAt string
+		if err := rows.Scan(&id, &otherID, &otherName, &otherUsername, &otherPhoto,
+			&callType, &duration, &endedBy, &createdAt); err != nil {
+			return nil, err
+		}
+		list = append(list, map[string]interface{}{
+			"id":               id,
+			"other_user_id":    otherID,
+			"other_user_name":  otherName,
+			"other_username":   otherUsername,
+			"other_photo":      otherPhoto,
+			"call_type":        callType,
+			"duration":         duration,
+			"ended_by":         endedBy,
+			"created_at":       createdAt,
+		})
+	}
+	if list == nil {
+		list = []map[string]interface{}{}
+	}
+	return list, nil
+}
+
 func (r *MessageRepo) PurgeConversation(convID, userID int64) ([]string, error) {
 	var member int64
 	if err := r.DB.QueryRow(`

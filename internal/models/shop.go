@@ -35,6 +35,7 @@ type CartItem struct {
 	ProductPrice float64  `json:"product_price,omitempty"`
 	VendorID     int64    `json:"vendor_id,omitempty"`
 	Images       []string `json:"images,omitempty"`
+	Origin       string   `json:"origin,omitempty"`
 }
 
 // ── ORDER ────────────────────────────────────────────────────────────────────

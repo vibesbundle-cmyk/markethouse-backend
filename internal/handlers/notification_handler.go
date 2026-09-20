@@ -119,19 +119,28 @@ type NotifPrefs struct {
 	Comments          bool `json:"comments"`
 	Reshares          bool `json:"reshares"`
 	Views             bool `json:"views"`
+	Mentions          bool `json:"mentions"`
+	CommunityMentions bool `json:"community_mentions"`
+	Ask               bool `json:"ask"`
 }
 
 // prefColumns maps a notification type to the toggle column that gates it.
 // Types not listed here are only gated by the master switch.
 var prefColumns = map[string]string{
 	"community_message": "community_messages",
-	"community_mention": "community_messages",
+	"community_mention": "community_mentions",
 	"community_post":    "community_messages",
+	"community_tag":     "community_mentions",
 	"transaction":       "wallet",
 	"like":              "likes",
 	"comment":           "comments",
 	"reshare":           "reshares",
 	"view":              "views",
+	"tag":               "mentions",
+	"supply_match":      "ask",
+	"demand_match":      "ask",
+	"buyer_interested":  "ask",
+	"ask_around":        "ask",
 }
 
 // notifyAllowed returns true when the recipient should receive a notification
@@ -161,9 +170,9 @@ func notifyAllowed(db *sql.DB, userID int64, ntype string) bool {
 
 func (h *NotificationHandler) GetPrefs(c *gin.Context) {
 	userID := c.GetInt64("user_id")
-	p := NotifPrefs{Master: true, CommunityMessages: true, Wallet: true, Likes: true, Comments: true, Reshares: true, Views: true}
-	h.DB.QueryRow(`SELECT master, community_messages, wallet, likes, comments, reshares, views FROM notification_preferences WHERE user_id=$1`, userID).
-		Scan(&p.Master, &p.CommunityMessages, &p.Wallet, &p.Likes, &p.Comments, &p.Reshares, &p.Views)
+	p := NotifPrefs{Master: true, CommunityMessages: true, Wallet: true, Likes: true, Comments: true, Reshares: true, Views: true, Mentions: true, CommunityMentions: true, Ask: true}
+	h.DB.QueryRow(`SELECT master, community_messages, wallet, likes, comments, reshares, views, mentions, community_mentions, ask FROM notification_preferences WHERE user_id=$1`, userID).
+		Scan(&p.Master, &p.CommunityMessages, &p.Wallet, &p.Likes, &p.Comments, &p.Reshares, &p.Views, &p.Mentions, &p.CommunityMentions, &p.Ask)
 	c.JSON(200, p)
 }
 
@@ -171,12 +180,13 @@ func (h *NotificationHandler) UpdatePrefs(c *gin.Context) {
 	userID := c.GetInt64("user_id")
 	var p NotifPrefs
 	c.ShouldBindJSON(&p)
-	h.DB.Exec(`INSERT INTO notification_preferences(user_id, master, community_messages, wallet, likes, comments, reshares, views)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+	h.DB.Exec(`INSERT INTO notification_preferences(user_id, master, community_messages, wallet, likes, comments, reshares, views, mentions, community_mentions, ask)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 		ON CONFLICT (user_id) DO UPDATE SET
 			master=EXCLUDED.master, community_messages=EXCLUDED.community_messages, wallet=EXCLUDED.wallet,
-			likes=EXCLUDED.likes, comments=EXCLUDED.comments, reshares=EXCLUDED.reshares, views=EXCLUDED.views`,
-		userID, p.Master, p.CommunityMessages, p.Wallet, p.Likes, p.Comments, p.Reshares, p.Views)
+			likes=EXCLUDED.likes, comments=EXCLUDED.comments, reshares=EXCLUDED.reshares, views=EXCLUDED.views,
+			mentions=EXCLUDED.mentions, community_mentions=EXCLUDED.community_mentions, ask=EXCLUDED.ask`,
+		userID, p.Master, p.CommunityMessages, p.Wallet, p.Likes, p.Comments, p.Reshares, p.Views, p.Mentions, p.CommunityMentions, p.Ask)
 	c.JSON(200, gin.H{"ok": true})
 }
 

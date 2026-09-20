@@ -264,6 +264,7 @@ func runSelfHealingMigrations(db *sql.DB) error {
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_communities_username ON communities(username) WHERE username IS NOT NULL AND username <> ''`,
 		`ALTER TABLE community_members ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'`,
 		`ALTER TABLE community_members ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'member'`,
+		`ALTER TABLE community_members ADD COLUMN IF NOT EXISTS last_read_message_id BIGINT NOT NULL DEFAULT 0`,
 		`ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS is_locked BOOLEAN DEFAULT false`,
 		`ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS views INTEGER DEFAULT 0`,
 		`CREATE TABLE IF NOT EXISTS community_post_views (
@@ -298,6 +299,22 @@ func runSelfHealingMigrations(db *sql.DB) error {
 		`ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS best_answer_id INTEGER`,
 		`ALTER TABLE community_comments ADD COLUMN IF NOT EXISTS is_best_answer BOOLEAN DEFAULT false`,
 
+		// community post background color (gradient behind text)
+		`ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS background_color TEXT DEFAULT ''`,
+		`ALTER TABLE community_poll_options ADD COLUMN IF NOT EXISTS added_by INTEGER DEFAULT 0`,
+		`ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS poll_allow_ideas BOOLEAN DEFAULT false`,
+
+		// mentions
+		`CREATE TABLE IF NOT EXISTS community_post_mentions (
+			id        SERIAL PRIMARY KEY,
+			post_id   INTEGER NOT NULL REFERENCES community_posts(id) ON DELETE CASCADE,
+			user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(post_id, user_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_post_mentions_post ON community_post_mentions(post_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_post_mentions_user ON community_post_mentions(user_id)`,
+
 		// reputation
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS reputation INTEGER NOT NULL DEFAULT 0`,
 
@@ -330,6 +347,18 @@ func runSelfHealingMigrations(db *sql.DB) error {
 		`ALTER TABLE messages ADD COLUMN IF NOT EXISTS latitude  DOUBLE PRECISION`,
 		`ALTER TABLE messages ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION`,
 		`ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP`,
+		`ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_forwarded BOOLEAN NOT NULL DEFAULT false`,
+		// DM reactions — one emoji per person per message, aggregated into
+		// per-emoji chips (mirrors community_message_reactions).
+		`CREATE TABLE IF NOT EXISTS message_reactions (
+			id         BIGSERIAL PRIMARY KEY,
+			message_id BIGINT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+			user_id    BIGINT NOT NULL REFERENCES users(id)    ON DELETE CASCADE,
+			emoji      TEXT   NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS ux_message_reactions_msg_user ON message_reactions(message_id, user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_message_reactions_message ON message_reactions(message_id)`,
 		// conversation settings
 		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS is_pinned            BOOLEAN DEFAULT false`,
 		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS is_archived          BOOLEAN DEFAULT false`,
@@ -341,6 +370,11 @@ func runSelfHealingMigrations(db *sql.DB) error {
 		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS bubble_opacity       REAL DEFAULT 1`,
 		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS disappearing_seconds INTEGER DEFAULT 0`,
 		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS is_muted             BOOLEAN DEFAULT false`,
+		// Per-user "archive" markers - archiving is personal: only the user who
+		// archived a chat sees it under Archived; the other person's list is
+		// untouched (mirrors cleared_at_one/two and hidden_at_one/two).
+		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS archived_at_one TIMESTAMPTZ`,
+		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS archived_at_two TIMESTAMPTZ`,
 		// per-user "clear chat" markers — history/unread counts hide everything
 		// older than the caller's own marker
 		`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS cleared_at_one TIMESTAMPTZ`,
@@ -356,9 +390,17 @@ func runSelfHealingMigrations(db *sql.DB) error {
 		`ALTER TABLE statuses ADD COLUMN IF NOT EXISTS reshared_from_id      INTEGER`,
 		`ALTER TABLE statuses ADD COLUMN IF NOT EXISTS reshared_from_user_id INTEGER`,
 		`ALTER TABLE statuses ADD COLUMN IF NOT EXISTS reshared_from_username TEXT NOT NULL DEFAULT ''`,
+		// text statuses can use a background PHOTO instead of a solid color
+		`ALTER TABLE statuses ADD COLUMN IF NOT EXISTS bg_image TEXT`,
 		// user can hide their name on other people's reshares of their
 		// statuses — feed then serves the origin as anonymous (default on)
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS hide_status_credit BOOLEAN NOT NULL DEFAULT false`,
+		// status music: optional song attached via the media editor. The song
+		// is baked into the media as audio — these fields just power the
+		// "♬ title" label shown next to the status time (never stamped on the
+		// media itself).
+		`ALTER TABLE statuses ADD COLUMN IF NOT EXISTS music_title TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE statuses ADD COLUMN IF NOT EXISTS music_url  TEXT NOT NULL DEFAULT ''`,
 
 		// communities created before "created_by"/"visibility" existed (old
 		// schema used "owner_id"/"type") — add the columns the handlers use
@@ -595,6 +637,38 @@ func runSelfHealingMigrations(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_user_contacts_user ON user_contacts(user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_user_contacts_hash ON user_contacts(phone_hash)`,
+
+		// Commerce listing comments (reusable threaded comment system)
+		`CREATE TABLE IF NOT EXISTS commerce_listing_comments (
+			id                 SERIAL PRIMARY KEY,
+			listing_id         INTEGER NOT NULL REFERENCES commerce_listings(id) ON DELETE CASCADE,
+			user_id            INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			content            TEXT NOT NULL,
+			parent_comment_id  INTEGER REFERENCES commerce_listing_comments(id) ON DELETE CASCADE,
+			created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_clc_listing ON commerce_listing_comments(listing_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_clc_parent  ON commerce_listing_comments(parent_comment_id)`,
+		`CREATE TABLE IF NOT EXISTS commerce_comment_likes (
+			id         SERIAL PRIMARY KEY,
+			comment_id INTEGER NOT NULL REFERENCES commerce_listing_comments(id) ON DELETE CASCADE,
+			user_id    INTEGER NOT NULL REFERENCES users(id)    ON DELETE CASCADE,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE (comment_id, user_id)
+		)`,
+
+		// Call logs — records every voice/video call initiated from DM chat.
+		`CREATE TABLE IF NOT EXISTS call_logs (
+			id          SERIAL PRIMARY KEY,
+			caller_id   BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			receiver_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			call_type   TEXT NOT NULL DEFAULT 'voice',
+			duration    INT DEFAULT 0,
+			ended_by    TEXT NOT NULL DEFAULT '',
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_call_logs_caller ON call_logs(caller_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_call_logs_receiver ON call_logs(receiver_id)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
@@ -686,6 +760,7 @@ func runNewFeatureMigrations(db *sql.DB) error {
 		`ALTER TABLE community_messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMP`,
 		`ALTER TABLE community_messages ADD COLUMN IF NOT EXISTS reply_to_id INTEGER REFERENCES community_messages(id) ON DELETE SET NULL`,
 		`ALTER TABLE communities ADD COLUMN IF NOT EXISTS slowmode_seconds INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE communities ADD COLUMN IF NOT EXISTS members_can_add BOOLEAN NOT NULL DEFAULT true`,
 		// Message reactions (community chat) — one row per user per emoji
 		`CREATE TABLE IF NOT EXISTS community_message_reactions (
 			id SERIAL PRIMARY KEY,
@@ -775,6 +850,11 @@ func runNewFeatureMigrations(db *sql.DB) error {
 		`ALTER TABLE supply_demand_listings ADD COLUMN IF NOT EXISTS negotiable BOOLEAN DEFAULT false`,
 		`ALTER TABLE supply_demand_listings ADD COLUMN IF NOT EXISTS condition TEXT DEFAULT ''`,
 		`ALTER TABLE supply_demand_listings ADD COLUMN IF NOT EXISTS quantity INTEGER DEFAULT 1`,
+		// Bridge to the shop cart/escrow: a supply listing gets a mirror
+		// "products" row (product_id) the first time it's added to a cart, and
+		// cart_items.origin records whether an item came from commerce or supply.
+		`ALTER TABLE supply_demand_listings ADD COLUMN IF NOT EXISTS product_id BIGINT`,
+		`ALTER TABLE cart_items ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'commerce'`,
 		// Supplier preferences — who wants to receive Ask Around notifications
 		`CREATE TABLE IF NOT EXISTS supplier_preferences (
 			id SERIAL PRIMARY KEY,
@@ -820,7 +900,9 @@ func runNewFeatureMigrations(db *sql.DB) error {
 			likes BOOLEAN NOT NULL DEFAULT true,
 			comments BOOLEAN NOT NULL DEFAULT true,
 			reshares BOOLEAN NOT NULL DEFAULT true,
-			views BOOLEAN NOT NULL DEFAULT true
+			views BOOLEAN NOT NULL DEFAULT true,
+			mentions BOOLEAN NOT NULL DEFAULT true,
+			community_mentions BOOLEAN NOT NULL DEFAULT true
 		)`,
 		// Registered device push tokens (FCM / APNs) for real OS push.
 		`CREATE TABLE IF NOT EXISTS device_tokens (
@@ -854,6 +936,42 @@ func runNewFeatureMigrations(db *sql.DB) error {
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS business_city TEXT`,
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS selling_types TEXT[]`,
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT false`,
+
+		// Community join approval
+		`ALTER TABLE communities ADD COLUMN IF NOT EXISTS require_approval BOOLEAN NOT NULL DEFAULT false`,
+		`ALTER TABLE communities ADD COLUMN IF NOT EXISTS notify_join_requests BOOLEAN NOT NULL DEFAULT true`,
+		`CREATE TABLE IF NOT EXISTS community_join_requests (
+			id          SERIAL PRIMARY KEY,
+			community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+			user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			status       TEXT NOT NULL DEFAULT 'pending',
+			created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(community_id, user_id)
+		)`,
+
+		// Community post tagging — tagged_users mirrors posts.tagged_users (CSV of user ids)
+		`ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS tagged_users TEXT NOT NULL DEFAULT ''`,
+		// media_type tells the client whether community media_url is a video or
+		// an image (defaults to 'image' for rows created before this existed).
+		`ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS media_type TEXT NOT NULL DEFAULT 'image'`,
+		// community post music — optional song attached via the media editor,
+		// same shape as statuses (music_title / music_url).
+		`ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS music_title TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS music_url TEXT NOT NULL DEFAULT ''`,
+		// Per-member "allow tagging" opt-out (default true = everyone can tag me)
+		`CREATE TABLE IF NOT EXISTS community_tag_settings (
+			community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+			user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			allow_tagging BOOLEAN NOT NULL DEFAULT true,
+			updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY(community_id, user_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_community_tag_settings_user ON community_tag_settings(user_id)`,
+
+		// Notification prefs: mentions, community mentions & ask (Demand & Supply matches)
+		`ALTER TABLE notification_preferences ADD COLUMN IF NOT EXISTS mentions BOOLEAN NOT NULL DEFAULT true`,
+		`ALTER TABLE notification_preferences ADD COLUMN IF NOT EXISTS community_mentions BOOLEAN NOT NULL DEFAULT true`,
+		`ALTER TABLE notification_preferences ADD COLUMN IF NOT EXISTS ask BOOLEAN NOT NULL DEFAULT true`,
 	}
 	for _, s := range stmts {
 		if _, err := db.Exec(s); err != nil {

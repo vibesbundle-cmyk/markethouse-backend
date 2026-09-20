@@ -116,11 +116,15 @@ func (r *InteractionRepo) GetSavedPosts(userID int64) ([]map[string]interface{},
 }
 
 // ================= RESHARE =================
-func (r *InteractionRepo) Reshare(userID, postID int64) error {
-	_, err := r.DB.Exec(`
+func (r *InteractionRepo) Reshare(userID, postID int64) (bool, error) {
+	res, err := r.DB.Exec(`
 		INSERT INTO post_reshare (user_id, post_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
 		userID, postID)
-	return err
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 func (r *InteractionRepo) Unreshare(userID, postID int64) error {
 	_, err := r.DB.Exec(

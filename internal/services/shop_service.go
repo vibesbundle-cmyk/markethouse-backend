@@ -75,7 +75,26 @@ func (s *ShopService) AddToCart(userID, id int64, qty int) error {
 	if !prod.IsUnlimitedStock && prod.StockCount < qty {
 		return fmt.Errorf("only %d left in stock", prod.StockCount)
 	}
-	return s.Repo.AddToCart(userID, prod.ID, qty)
+	return s.Repo.AddToCart(userID, prod.ID, qty, "commerce")
+}
+
+// AddSdToCart adds a Supply & Demand "supply" listing to the buyer's cart.
+// It mirrors the listing onto the shop products table (via the product_id
+// bridge) and records the item's origin as "supply" so the cart screen can
+// tell supply items apart from commerce ones. The supplier is NOT notified
+// here — they only learn about the buyer once payment completes.
+func (s *ShopService) AddSdToCart(userID, sdListingID int64, qty int) error {
+	if qty <= 0 {
+		return errors.New("quantity must be at least 1")
+	}
+	prod, err := s.Repo.EnsureProductForSdListing(sdListingID)
+	if err != nil {
+		return err
+	}
+	if prod.UserID == userID {
+		return errors.New("you can't add your own listing to cart")
+	}
+	return s.Repo.AddToCart(userID, prod.ID, qty, "supply")
 }
 
 func (s *ShopService) GetCart(userID int64) ([]models.CartItem, float64, error) {
@@ -253,6 +272,7 @@ func (s *ShopService) ConfirmBatchPayment(buyerID int64, reference string) ([]mo
 			Description: fmt.Sprintf("Escrow for order #%d — %s", o.ID, o.ProductName),
 		})
 		_, _ = s.Repo.DB.Exec(`UPDATE users SET sales_score = sales_score + 1 WHERE id=$1`, o.VendorID)
+		s.notifySupplierOnPayment(o)
 		orders[i].Status = models.OrderPaid
 	}
 	return orders, nil
@@ -306,7 +326,37 @@ func (s *ShopService) ConfirmPayment(buyerID int64, req CheckoutRequest, referen
 		Description: fmt.Sprintf("Escrow for order #%d — %s", orderID, prod.Name),
 	})
 
+	s.notifySupplierOnPayment(models.Order{
+		BuyerID:   buyerID,
+		VendorID:  prod.UserID,
+		ProductID: req.ProductID,
+	})
+
 	return s.Repo.GetOrderByID(orderID)
+}
+
+// notifySupplierOnPayment tells a Supply & Demand supplier that a buyer has
+// actually PAID for their listed item. It only fires for supply listings that
+// were bought through the shop cart (identified via the product_id bridge) and
+// never fires on add-to-cart — per the buyer-facing flow, the supplier learns
+// about the sale only once money has moved.
+func (s *ShopService) notifySupplierOnPayment(o models.Order) {
+	if o.BuyerID == o.VendorID {
+		return
+	}
+	sdID, sellerID, title, found, err := s.Repo.FindSdSupplyByProductID(o.ProductID)
+	if err != nil || !found {
+		return
+	}
+	_, _ = s.Repo.DB.Exec(`INSERT INTO notifications(user_id, actor_id, type, title, body, ref_type, ref_id, entity_type, entity_id)
+		VALUES($1,$2,'sale_paid',$3,$4,'sd_listing',$5,'sd_listing',$5)`,
+		sellerID, o.BuyerID,
+		"Someone just paid for your item",
+		fmt.Sprintf("\"%s\" has been paid for — check your orders to arrange delivery.", title),
+		sdID)
+	SendPush(s.Repo.DB, sellerID, "Someone just paid for your item",
+		fmt.Sprintf("\"%s\" has been paid for — check your orders to arrange delivery.", title),
+		map[string]string{"type": "sale_paid", "entity_type": "sd_listing", "entity_id": fmt.Sprint(sdID), "actor_id": fmt.Sprint(o.BuyerID)})
 }
 
 // ── DELIVERY ─────────────────────────────────────────────────────────────────

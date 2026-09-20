@@ -184,77 +184,11 @@ func (h *SupplyDemandHandler) CreateListing(c *gin.Context) {
 		return
 	}
 
-	// Supply/Demand match notifications — when a new listing goes up, ping
-	// the people on the other side of the market who are looking for it.
-	if req.Kind == "supply" {
-		h.notifyMatchesForSupply(userID, id, req.Title, req.Category, req.Lat, req.Lng, req.RadiusKm)
-	} else if req.Kind == "demand" {
-		h.notifyMatchesForDemand(userID, id, req.Title, req.Category, req.Lat, req.Lng, req.RadiusKm)
-	}
-
+	// NOTE: posting a demand does NOT notify matching suppliers. The supplier is
+	// only made aware after the buyer pays — see the payment hook. (The separate
+	// "Ask Around" feature handles opt-in supplier pings; it's untouched here.)
+	_ = id
 	c.JSON(200, gin.H{"id": id})
-}
-
-// notifyMatchesForSupply pings owners of "ask_around" demands (buyers) whose
-// wanted ad matches this new supply by category (and proximity, when set).
-func (h *SupplyDemandHandler) notifyMatchesForSupply(sellerID, listingID int64, title, category string, lat, lng *float64, radiusKm int) {
-	if category == "" {
-		return
-	}
-	q := `SELECT DISTINCT l.user_id, l.id FROM supply_demand_listings l
-	      WHERE l.kind='ask_around' AND l.status='active' AND l.category=$1 AND l.user_id<>$2`
-	args := []interface{}{category, sellerID}
-	if lat != nil && lng != nil {
-		q += ` AND l.location_lat IS NOT NULL AND l.location_lng IS NOT NULL
-		       AND (6371 * acos(LEAST(1, GREATEST(-1,
-		         cos(radians($3)) * cos(radians(l.location_lat)) * cos(radians(l.location_lng) - radians($4))
-		         + sin(radians($3)) * sin(radians(l.location_lat))
-		       )))) <= GREATEST(l.radius_km, $5, 5)`
-		args = append(args, *lat, *lng, radiusKm)
-	}
-	rows, err := h.DB.Query(q, args...)
-	if err != nil {
-		return
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var buyerID, lid int64
-		if rows.Scan(&buyerID, &lid) == nil {
-			h.notify(buyerID, sellerID, "supply_match", "New match for your request",
-				fmt.Sprintf("\"%s\" matches what you're looking for", title), "sd_listing", lid)
-		}
-	}
-}
-
-// notifyMatchesForDemand pings suppliers who already have a matching "supply"
-// listing for this new wanted ad.
-func (h *SupplyDemandHandler) notifyMatchesForDemand(buyerID, listingID int64, title, category string, lat, lng *float64, radiusKm int) {
-	if category == "" {
-		return
-	}
-	q := `SELECT DISTINCT l.user_id, l.id FROM supply_demand_listings l
-	      WHERE l.kind='supply' AND l.status='active' AND l.category=$1 AND l.user_id<>$2`
-	args := []interface{}{category, buyerID}
-	if lat != nil && lng != nil {
-		q += ` AND l.location_lat IS NOT NULL AND l.location_lng IS NOT NULL
-		       AND (6371 * acos(LEAST(1, GREATEST(-1,
-		         cos(radians($3)) * cos(radians(l.location_lat)) * cos(radians(l.location_lng) - radians($4))
-		         + sin(radians($3)) * sin(radians(l.location_lat))
-		       )))) <= GREATEST(l.radius_km, $5, 5)`
-		args = append(args, *lat, *lng, radiusKm)
-	}
-	rows, err := h.DB.Query(q, args...)
-	if err != nil {
-		return
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var sellerID, lid int64
-		if rows.Scan(&sellerID, &lid) == nil {
-			h.notify(sellerID, buyerID, "demand_match", "New buyer looking for your item",
-				fmt.Sprintf("Someone wants \"%s\" — you may have a match", title), "sd_listing", lid)
-		}
-	}
 }
 
 // GetListings returns every active listing of the given kind. Both Supply
@@ -401,11 +335,11 @@ func (h *SupplyDemandHandler) ExpressInterest(c *gin.Context) {
 		return
 	}
 
+	// Remind the buyer themselves that the item is in their cart. The seller is
+	// intentionally NOT notified here — they only learn about the buyer once
+	// payment completes (see the payment hook).
 	h.notify(buyerID, 0, "cart_reminder", "Complete your payment",
 		fmt.Sprintf("\"%s\" is in your cart — pay now before someone else takes it.", title),
-		"sd_listing", listingID)
-	h.notify(sellerID, buyerID, "buyer_interested", "Someone wants your item",
-		fmt.Sprintf("A buyer is interested in \"%s\".", title),
 		"sd_listing", listingID)
 
 	c.JSON(200, gin.H{"ok": true})

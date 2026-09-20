@@ -4,6 +4,8 @@ import (
 	"markethouse/internal/models"
 	"markethouse/internal/services"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -15,14 +17,16 @@ type MessageHandler struct {
 func (h *MessageHandler) SendMessage(c *gin.Context) {
 	senderID := c.GetInt64("user_id")
 	var req struct {
-		ReceiverID  int64   `json:"receiver_id"`
-		Content     string  `json:"content"`
-		MessageType string  `json:"message_type"`
-		MediaURL    *string `json:"media_url"`
-		MediaType   *string `json:"media_type"`
-		ReplyToID   *int64  `json:"reply_to_id"`
-		Latitude    *float64 `json:"latitude"`
-		Longitude   *float64 `json:"longitude"`
+		ReceiverID   int64    `json:"receiver_id"`
+		Content      string   `json:"content"`
+		MessageType  string   `json:"message_type"`
+		MediaURL     *string  `json:"media_url"`
+		MediaType    *string  `json:"media_type"`
+		ReplyToID    *int64   `json:"reply_to_id"`
+		Latitude     *float64 `json:"latitude"`
+		Longitude    *float64 `json:"longitude"`
+		IsForwarded  bool     `json:"is_forwarded"`
+		ExpiresIn    int      `json:"expires_in"` // seconds; per-message disappearing
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
@@ -43,14 +47,19 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		}
 	}
 	msg := models.Message{
-		ReceiverID:  req.ReceiverID,
-		Content:     req.Content,
-		MessageType: req.MessageType,
-		MediaURL:    req.MediaURL,
-		MediaType:   req.MediaType,
-		ReplyToID:   req.ReplyToID,
-		Latitude:    req.Latitude,
-		Longitude:   req.Longitude,
+		ReceiverID:   req.ReceiverID,
+		Content:      req.Content,
+		MessageType:  req.MessageType,
+		MediaURL:     req.MediaURL,
+		MediaType:    req.MediaType,
+		ReplyToID:    req.ReplyToID,
+		Latitude:     req.Latitude,
+		Longitude:    req.Longitude,
+		IsForwarded:  req.IsForwarded,
+	}
+	if req.ExpiresIn > 0 {
+		t := time.Now().Add(time.Duration(req.ExpiresIn) * time.Second)
+		msg.ExpiresAt = &t
 	}
 	result, err := h.Service.SendMessage(senderID, req.ReceiverID, msg)
 	if err != nil {
@@ -98,11 +107,21 @@ func (h *MessageHandler) PinMessage(c *gin.Context) {
 }
 
 func (h *MessageHandler) ReactMessage(c *gin.Context) {
+	userID := c.GetInt64("user_id")
 	msgID, _ := strconv.ParseInt(c.Param("msg_id"), 10, 64)
-	var req struct{ Reaction string `json:"reaction"` }
-	c.ShouldBindJSON(&req)
-	h.Service.ReactMessage(msgID, req.Reaction)
-	c.JSON(200, gin.H{"ok": true})
+	var req struct {
+		Emoji string `json:"emoji"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Emoji) == "" {
+		c.JSON(400, gin.H{"error": "emoji required"})
+		return
+	}
+	reactions, err := h.Service.ReactMessage(userID, msgID, req.Emoji)
+	if err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"ok": true, "reactions": reactions})
 }
 
 func (h *MessageHandler) EditMessage(c *gin.Context) {
@@ -189,7 +208,7 @@ func (h *MessageHandler) UpdateConversationSettings(c *gin.Context) {
 	convID, _ := strconv.ParseInt(c.Param("conv_id"), 10, 64)
 	var settings map[string]interface{}
 	c.ShouldBindJSON(&settings)
-	if err := h.Service.UpdateConversationSettings(convID, settings); err != nil {
+	if err := h.Service.UpdateConversationSettings(convID, userID, settings); err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
@@ -201,6 +220,38 @@ func (h *MessageHandler) UpdateConversationSettings(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{"ok": true, "conversation": conv})
+}
+
+func (h *MessageHandler) LogCall(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	var req struct {
+		ReceiverID int64  `json:"receiver_id"`
+		CallType   string `json:"call_type"`
+		Duration   int    `json:"duration"`
+		EndedBy    string `json:"ended_by"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	if req.CallType == "" {
+		req.CallType = "voice"
+	}
+	if err := h.Service.LogCall(userID, req.ReceiverID, req.CallType, req.Duration, req.EndedBy); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"ok": true})
+}
+
+func (h *MessageHandler) GetCallLogs(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	logs, err := h.Service.GetCallLogs(userID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"call_logs": logs})
 }
 
 func (h *MessageHandler) SearchMessages(c *gin.Context) {

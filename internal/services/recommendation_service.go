@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -108,7 +109,7 @@ func (s *RecommendationService) RecordSignal(userID, postID int64, signal, categ
 
 	// 1. Write to permanent store
 	go func() {
-		_, err := s.DB.Exec(`
+		res, err := s.DB.Exec(`
 			INSERT INTO post_signals(user_id, post_id, signal, weight, category, created_at)
 			VALUES($1,$2,$3,$4,$5,NOW())
 			ON CONFLICT DO NOTHING`,
@@ -116,6 +117,13 @@ func (s *RecommendationService) RecordSignal(userID, postID int64, signal, categ
 		if err != nil {
 			log.Printf("[rec] signal insert: %v", err)
 			return
+		}
+
+		// First-time view by a non-author counts toward the post's view count.
+		if signal == "view" {
+			if n, _ := res.RowsAffected(); n > 0 {
+				s.DB.Exec(`UPDATE posts SET views = COALESCE(views,0) + 1 WHERE id=$1 AND user_id<>$2`, postID, userID)
+			}
 		}
 
 		// 2. Update post's cached quality score in Redis
@@ -266,8 +274,10 @@ func (s *RecommendationService) GetUserInterests(userID int64) map[string]float6
 		json.Unmarshal(raw, &m)
 		return m
 	}
-	// DB fallback
-	rows, _ := s.DB.Query(`SELECT category, weight FROM user_interest_profiles WHERE user_id=$1 AND profile_type='content'`, userID)
+	// DB fallback (explicit picks from the user ride on top of learned ones)
+	rows, _ := s.DB.Query(`SELECT category,
+		CASE WHEN profile_type='explicit' THEN 90 ELSE weight END
+		FROM user_interest_profiles WHERE user_id=$1 AND profile_type IN ('content','explicit')`, userID)
 	m := map[string]float64{}
 	if rows != nil {
 		defer rows.Close()
@@ -275,10 +285,57 @@ func (s *RecommendationService) GetUserInterests(userID int64) map[string]float6
 			var cat string
 			var w float64
 			rows.Scan(&cat, &w)
-			m[cat] = w
+			if w > m[cat] {
+				m[cat] = w
+			}
 		}
 	}
 	return m
+}
+
+// SetExplicitInterests stores the user's manually-picked categories.
+func (s *RecommendationService) SetExplicitInterests(userID int64, categories []string) error {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM user_interest_profiles WHERE user_id=$1 AND profile_type='explicit'`, userID); err != nil {
+		return err
+	}
+	for _, cat := range categories {
+		cat = strings.TrimSpace(cat)
+		if cat == "" {
+			continue
+		}
+		if _, err := tx.Exec(`INSERT INTO user_interest_profiles(user_id, category, weight, profile_type, updated_at) VALUES($1,$2,90,'explicit',NOW()) ON CONFLICT DO NOTHING`, userID, cat); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// refresh the Redis cache so For You is instantly re-ranked
+	key := fmt.Sprintf("user:interests:%d", userID)
+	b, _ := json.Marshal(s.GetUserInterests(userID))
+	s.Redis.Set(bgCtx, key, b, 30*24*time.Hour)
+	return nil
+}
+
+// GetExplicitInterests returns the user's manually-picked category list.
+func (s *RecommendationService) GetExplicitInterests(userID int64) []string {
+	rows, _ := s.DB.Query(`SELECT category FROM user_interest_profiles WHERE user_id=$1 AND profile_type='explicit' ORDER BY weight DESC`, userID)
+	if rows == nil {
+		return nil
+	}
+	defer rows.Close()
+	var cats []string
+	for rows.Next() {
+		var cat string
+		rows.Scan(&cat)
+		cats = append(cats, cat)
+	}
+	return cats
 }
 
 // ─── Trending ─────────────────────────────────────────────────────────────────
@@ -422,7 +479,7 @@ func (s *RecommendationService) AssignTestAudience(postID, authorID int64, categ
 		// 40 interest-matched users
 		rows, _ := s.DB.Query(`
 			SELECT user_id FROM user_interest_profiles
-			WHERE category=$1 AND profile_type='content' AND weight > 30
+			WHERE category=$1 AND profile_type IN ('content','explicit') AND weight > 30
 			AND user_id != $2
 			ORDER BY weight DESC LIMIT 40`, category, authorID)
 		if rows != nil {

@@ -111,6 +111,26 @@ func (h *ShopHandler) AddToCart(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "added to cart"})
 }
 
+// POST /supply-demand/:id/cart — add a Supply & Demand "supply" listing to the
+// buyer's real cart (mirrored onto the shop products table with origin='supply').
+// The supplier is NOT notified here; they only learn once the buyer pays.
+func (h *ShopHandler) AddSdToCart(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	listingID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	var req struct {
+		Quantity int `json:"quantity"`
+	}
+	_ = c.ShouldBindJSON(&req)
+	if req.Quantity <= 0 {
+		req.Quantity = 1
+	}
+	if err := h.Service.AddSdToCart(userID, listingID, req.Quantity); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "added to cart"})
+}
+
 // GET /shop/cart
 func (h *ShopHandler) GetCart(c *gin.Context) {
 	userID := c.GetInt64("user_id")

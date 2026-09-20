@@ -53,12 +53,17 @@ func (h *PostHandler) CreatePost(c *gin.Context) {
 			files = []*multipart.FileHeader{f}
 		}
 	}
-	if len(files) == 0 {
+
+	// Optional media_url = reshare-as-post: reuse an existing post's media
+	// instead of uploading a new file.
+	mediaURL := c.PostForm("media_url")
+	mediaType := c.PostForm("media_type")
+	if len(files) == 0 && mediaURL == "" {
 		c.JSON(400, gin.H{"error": "at least one file is required"})
 		return
 	}
 
-	post, err := h.Service.CreatePost(userID, caption, postType, category, price, isLocked, taggedUsers, location, audience, audienceUserIDs, lat, lng, files)
+	post, err := h.Service.CreatePost(userID, caption, postType, category, price, isLocked, taggedUsers, location, audience, audienceUserIDs, lat, lng, files, mediaURL, mediaType)
 	if err != nil {
 		log.Printf("[POST] create error user=%d: %v", userID, err)
 		c.JSON(500, gin.H{"error": err.Error()})

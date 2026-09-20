@@ -1,4 +1,4 @@
--- ============================================================
+your-- ============================================================
 -- MARKETHOUSE — COMMUNITY TABLE FIX
 -- The "communities" table (as actually created by vinci.sql) has
 -- columns: type, owner_id  — but community_handler.go queries/inserts

@@ -17,7 +17,7 @@ services:
         description: everywhere
 
   - type: web
-    name: markethouse-api
+    name: markethouse-api2
     runtime: docker
     plan: free
     region: oregon
@@ -36,11 +36,11 @@ services:
       - key: JWT_SECRET
         generateValue: true
       - key: BASE_URL
-        value: https://markethouse-api.onrender.com
+        value: https://markethouse-api2.onrender.com
       # Flutter web origin(s) allowed to call the API (comma-separated).
       # Replace with your real static-site URL once the frontend is deployed.
       - key: CORS_ORIGINS
-        value: https://markethouse-web.onrender.com,https://markethouse.github.io,https://markethous.netlify.app
+        value: https://markethouseapp.netlify.app
       # Set these in the Render dashboard (Environment) after deploy:
       - key: BREVO_API_KEY
         sync: false

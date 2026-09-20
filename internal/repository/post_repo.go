@@ -6,6 +6,7 @@ import (
 	"log"
 	"markethouse/internal/models"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/lib/pq"
@@ -130,10 +131,11 @@ func (r *PostRepo) GetPostsByHashtag(viewerID int64, tag string) ([]map[string]i
 		(SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comment_count,
 		EXISTS(SELECT 1 FROM likes WHERE post_id=p.id AND user_id=$1) as is_liked,
 		EXISTS(SELECT 1 FROM saves WHERE post_id=p.id AND user_id=$1) as is_saved,
-		p.views
+		EXISTS(SELECT 1 FROM post_reshare WHERE post_id=p.id AND user_id=$1) as is_reshared,
+		(SELECT COUNT(*) FROM post_reshare WHERE post_id = p.id) as reshare_count
 	FROM posts p
 	JOIN users u ON p.user_id = u.id
-	WHERE EXISTS(SELECT 1 FROM post_hashtags h WHERE h.post_id = p.id AND h.tag = LOWER($2))` + audienceFilter("$1") + `
+	WHERE EXISTS(SELECT 1 FROM post_hashtags h WHERE h.post_id = p.id AND h.tag = LOWER($2))`+audienceFilter("$1")+`
 	ORDER BY p.created_at DESC
 	`, viewerID, tag)
 	if err != nil {
@@ -222,35 +224,39 @@ func (r *PostRepo) GetUserPosts(targetUserID, viewerID int64) ([]map[string]inte
 		(SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comment_count,
 		EXISTS(SELECT 1 FROM likes WHERE post_id=p.id AND user_id=$2) as is_liked,
 		EXISTS(SELECT 1 FROM saves WHERE post_id=p.id AND user_id=$2) as is_saved,
+		EXISTS(SELECT 1 FROM post_reshare WHERE post_id=p.id AND user_id=$2) as is_reshared,
+		(SELECT COUNT(*) FROM post_reshare WHERE post_id = p.id) as reshare_count,
 		p.pinned_at,
 		p.views
 	FROM posts p
 	JOIN users u ON p.user_id = u.id
-	WHERE p.user_id = $1` + audienceFilter("$2") + `
+	WHERE p.user_id = $1`+audienceFilter("$2")+`
 	ORDER BY p.pinned_at DESC NULLS LAST, p.created_at DESC
 	`, targetUserID, viewerID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	return scanUserPosts(r.DB, rows)
+	// Views are personal — only surface them on the profile when the viewer
+	// IS the account owner (so the eye icon stays but never for public eyes).
+	return scanUserPosts(r.DB, rows, targetUserID == viewerID)
 }
 
 // scanUserPosts mirrors scanPostRows but also reads the trailing pinned_at
 // column so pinned posts surface a "pinned" flag for profile grids.
-func scanUserPosts(db *sql.DB, rows *sql.Rows) ([]map[string]interface{}, error) {
+func scanUserPosts(db *sql.DB, rows *sql.Rows, showViews bool) ([]map[string]interface{}, error) {
 	var posts []map[string]interface{}
 	for rows.Next() {
 		var (
 			postID                                            int64
 			caption, mediaURL, mediaType, postType, createdAt string
 			username, profilePhoto                            sql.NullString
-			taggedUsers, location, audience, audienceUserIDs sql.NullString
-			latitude, longitude                              sql.NullFloat64
+			taggedUsers, location, audience, audienceUserIDs  sql.NullString
+			latitude, longitude                               sql.NullFloat64
 			price                                             float64
 			dbUserID                                          int64
-			likeCount, commentCount, views                    int
-			isLiked, isSaved, isLocked                        bool
+			likeCount, commentCount, views, reshareCount      int
+			isLiked, isSaved, isLocked, isReshared            bool
 			pinnedAt                                          sql.NullTime
 		)
 		err := rows.Scan(
@@ -258,27 +264,27 @@ func scanUserPosts(db *sql.DB, rows *sql.Rows) ([]map[string]interface{}, error)
 			&taggedUsers, &location, &latitude, &longitude, &audience, &audienceUserIDs, &createdAt,
 			&dbUserID, &username, &profilePhoto,
 			&likeCount, &commentCount,
-			&isLiked, &isSaved, &pinnedAt, &views,
+			&isLiked, &isSaved, &isReshared, &reshareCount, &pinnedAt, &views,
 		)
 		if err != nil {
 			return nil, err
 		}
-		posts = append(posts, map[string]interface{}{
-			"id":           postID,
-			"caption":      caption,
-			"media_url":    mediaURL,
-			"media_type":   mediaType,
-			"post_type":    postType,
-			"price":        price,
-			"is_locked":    isLocked,
-			"tagged_users": taggedUsers.String,
-			"location":     location.String,
-			"latitude":     nullableFloat(latitude),
-			"longitude":    nullableFloat(longitude),
-			"audience":     audience.String,
+		post := map[string]interface{}{
+			"id":                postID,
+			"caption":           caption,
+			"media_url":         mediaURL,
+			"media_type":        mediaType,
+			"post_type":         postType,
+			"price":             price,
+			"is_locked":         isLocked,
+			"tagged_users":      taggedUsers.String,
+			"location":          location.String,
+			"latitude":          nullableFloat(latitude),
+			"longitude":         nullableFloat(longitude),
+			"audience":          audience.String,
 			"audience_user_ids": audienceUserIDs.String,
-			"created_at":   createdAt,
-			"pinned":       pinnedAt.Valid,
+			"created_at":        createdAt,
+			"pinned":            pinnedAt.Valid,
 			"user": map[string]interface{}{
 				"id":            dbUserID,
 				"username":      username.String,
@@ -288,13 +294,21 @@ func scanUserPosts(db *sql.DB, rows *sql.Rows) ([]map[string]interface{}, error)
 			"comment_count": commentCount,
 			"is_liked":      isLiked,
 			"is_saved":      isSaved,
-			"views":         views,
-		})
+			"is_reshared":   isReshared,
+			"reshare_count": reshareCount,
+		}
+		if showViews {
+			post["views"] = views
+		}
+		posts = append(posts, post)
 	}
 	if posts == nil {
 		posts = []map[string]interface{}{}
 	}
 	if err := attachMedia(db, posts); err != nil {
+		return nil, err
+	}
+	if err := AttachTagged(db, posts); err != nil {
 		return nil, err
 	}
 	return posts, nil
@@ -311,11 +325,12 @@ func (r *PostRepo) GetLikedPosts(userID int64) ([]map[string]interface{}, error)
 		(SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comment_count,
 		true as is_liked,
 		EXISTS(SELECT 1 FROM saves WHERE post_id=p.id AND user_id=$1) as is_saved,
-		p.views
+		EXISTS(SELECT 1 FROM post_reshare WHERE post_id=p.id AND user_id=$1) as is_reshared,
+		(SELECT COUNT(*) FROM post_reshare WHERE post_id = p.id) as reshare_count
 	FROM likes l
 	JOIN posts p ON p.id = l.post_id
 	JOIN users u ON p.user_id = u.id
-	WHERE l.user_id = $1` + audienceFilter("$1") + `
+	WHERE l.user_id = $1`+audienceFilter("$1")+`
 	ORDER BY l.created_at DESC
 	`, userID)
 	if err != nil {
@@ -336,11 +351,12 @@ func (r *PostRepo) GetResharedPostsForUser(targetUserID, viewerID int64) ([]map[
 		(SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comment_count,
 		EXISTS(SELECT 1 FROM likes WHERE post_id=p.id AND user_id=$2) as is_liked,
 		EXISTS(SELECT 1 FROM saves WHERE post_id=p.id AND user_id=$2) as is_saved,
-		p.views
+		EXISTS(SELECT 1 FROM post_reshare WHERE post_id=p.id AND user_id=$2) as is_reshared,
+		(SELECT COUNT(*) FROM post_reshare WHERE post_id = p.id) as reshare_count
 	FROM post_reshare pr
 	JOIN posts p ON p.id = pr.post_id
 	JOIN users u ON p.user_id = u.id
-	WHERE pr.user_id = $1` + audienceFilter("$2") + `
+	WHERE pr.user_id = $1`+audienceFilter("$2")+`
 	ORDER BY pr.created_at DESC
 	`, targetUserID, viewerID)
 	if err != nil {
@@ -361,11 +377,12 @@ func (r *PostRepo) GetResharedPosts(userID int64) ([]map[string]interface{}, err
 		(SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comment_count,
 		EXISTS(SELECT 1 FROM likes WHERE post_id=p.id AND user_id=$1) as is_liked,
 		EXISTS(SELECT 1 FROM saves WHERE post_id=p.id AND user_id=$1) as is_saved,
-		p.views
+		EXISTS(SELECT 1 FROM post_reshare WHERE post_id=p.id AND user_id=$1) as is_reshared,
+		(SELECT COUNT(*) FROM post_reshare WHERE post_id = p.id) as reshare_count
 	FROM post_reshare pr
 	JOIN posts p ON p.id = pr.post_id
 	JOIN users u ON p.user_id = u.id
-	WHERE pr.user_id = $1` + audienceFilter("$1") + `
+	WHERE pr.user_id = $1`+audienceFilter("$1")+`
 	ORDER BY pr.created_at DESC
 	`, userID)
 	if err != nil {
@@ -386,10 +403,11 @@ func (r *PostRepo) GetAllPostsWithUser(userID int64) ([]map[string]interface{}, 
 		(SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comment_count,
 		EXISTS(SELECT 1 FROM likes WHERE post_id=p.id AND user_id=$1) as is_liked,
 		EXISTS(SELECT 1 FROM saves WHERE post_id=p.id AND user_id=$1) as is_saved,
-		p.views
+		EXISTS(SELECT 1 FROM post_reshare WHERE post_id=p.id AND user_id=$1) as is_reshared,
+		(SELECT COUNT(*) FROM post_reshare WHERE post_id = p.id) as reshare_count
 	FROM posts p
 	JOIN users u ON p.user_id = u.id
-	WHERE p.post_type = 'social'` + audienceFilter("$1") + `
+	WHERE p.post_type = 'social'`+audienceFilter("$1")+`
 	ORDER BY p.created_at DESC
 	`, userID)
 	if err != nil {
@@ -410,10 +428,11 @@ func (r *PostRepo) GetBusinessPosts(userID int64) ([]map[string]interface{}, err
 		(SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comment_count,
 		EXISTS(SELECT 1 FROM likes WHERE post_id=p.id AND user_id=$1) as is_liked,
 		EXISTS(SELECT 1 FROM saves WHERE post_id=p.id AND user_id=$1) as is_saved,
-		p.views
+		EXISTS(SELECT 1 FROM post_reshare WHERE post_id=p.id AND user_id=$1) as is_reshared,
+		(SELECT COUNT(*) FROM post_reshare WHERE post_id = p.id) as reshare_count
 	FROM posts p
 	JOIN users u ON p.user_id = u.id
-	WHERE p.post_type = 'product'` + audienceFilter("$1") + `
+	WHERE p.post_type = 'product'`+audienceFilter("$1")+`
 	ORDER BY p.created_at DESC
 	`, userID)
 	if err != nil {
@@ -433,11 +452,12 @@ func (r *PostRepo) GetFollowingPosts(userID int64) ([]map[string]interface{}, er
 		(SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comment_count,
 		EXISTS(SELECT 1 FROM likes WHERE post_id=p.id AND user_id=$1) as is_liked,
 		EXISTS(SELECT 1 FROM saves WHERE post_id=p.id AND user_id=$1) as is_saved,
-		p.views
+		EXISTS(SELECT 1 FROM post_reshare WHERE post_id=p.id AND user_id=$1) as is_reshared,
+		(SELECT COUNT(*) FROM post_reshare WHERE post_id = p.id) as reshare_count
 	FROM posts p
 	JOIN users u ON p.user_id = u.id
 	INNER JOIN follows f ON p.user_id = f.following_id
-	WHERE f.follower_id = $1` + audienceFilter("$1") + `
+	WHERE f.follower_id = $1`+audienceFilter("$1")+`
 	ORDER BY p.created_at DESC
 	`, userID)
 	if err != nil {
@@ -471,8 +491,8 @@ func (r *PostRepo) GetPostByID(postID, viewerID int64) (map[string]interface{}, 
 		postIDOut                                         int64
 		caption, mediaURL, mediaType, postType, createdAt string
 		username, profilePhoto                            sql.NullString
-		taggedUsers, location, audience, audienceUserIDs sql.NullString
-		latitude, longitude                              sql.NullFloat64
+		taggedUsers, location, audience, audienceUserIDs  sql.NullString
+		latitude, longitude                               sql.NullFloat64
 		price                                             float64
 		dbUserID                                          int64
 		likeCount, commentCount, reshareCount, views      int
@@ -488,27 +508,23 @@ func (r *PostRepo) GetPostByID(postID, viewerID int64) (map[string]interface{}, 
 	if err != nil {
 		return nil, err
 	}
-	// Count a view only when someone other than the author opens the post.
-	if dbUserID != viewerID {
-		if _, e := r.DB.Exec(`UPDATE posts SET views = views + 1 WHERE id = $1`, postID); e == nil {
-			views++
-		}
-	}
+	// Views are personal — only the post author sees them.
+	isAuthor := dbUserID == viewerID
 	post := map[string]interface{}{
-		"id":           postIDOut,
-		"caption":      caption,
-		"media_url":    mediaURL,
-		"media_type":   mediaType,
-		"post_type":    postType,
-		"price":        price,
-		"is_locked":    isLocked,
-		"tagged_users": taggedUsers.String,
-		"location":     location.String,
-		"latitude":     nullableFloat(latitude),
-		"longitude":    nullableFloat(longitude),
-		"audience":     audience.String,
+		"id":                postIDOut,
+		"caption":           caption,
+		"media_url":         mediaURL,
+		"media_type":        mediaType,
+		"post_type":         postType,
+		"price":             price,
+		"is_locked":         isLocked,
+		"tagged_users":      taggedUsers.String,
+		"location":          location.String,
+		"latitude":          nullableFloat(latitude),
+		"longitude":         nullableFloat(longitude),
+		"audience":          audience.String,
 		"audience_user_ids": audienceUserIDs.String,
-		"created_at":   createdAt,
+		"created_at":        createdAt,
 		"user": map[string]interface{}{
 			"id":            dbUserID,
 			"username":      username.String,
@@ -517,18 +533,24 @@ func (r *PostRepo) GetPostByID(postID, viewerID int64) (map[string]interface{}, 
 		"like_count":    likeCount,
 		"comment_count": commentCount,
 		"reshare_count": reshareCount,
-		"views":         views,
 		"is_liked":      isLiked,
 		"is_saved":      isSaved,
 		"is_reshared":   isReshared,
 	}
+	if isAuthor {
+		post["views"] = views
+	}
 	if err := attachMedia(r.DB, []map[string]interface{}{post}); err != nil {
+		return nil, err
+	}
+	if err := AttachTagged(r.DB, []map[string]interface{}{post}); err != nil {
 		return nil, err
 	}
 	return post, nil
 }
 
-// shared row scanner
+// shared row scanner — views are deliberately omitted from feed/profile
+// responses because they are personal to the post author only.
 func scanPostRows(db *sql.DB, rows *sql.Rows) ([]map[string]interface{}, error) {
 	var posts []map[string]interface{}
 	for rows.Next() {
@@ -536,38 +558,38 @@ func scanPostRows(db *sql.DB, rows *sql.Rows) ([]map[string]interface{}, error) 
 			postID                                            int64
 			caption, mediaURL, mediaType, postType, createdAt string
 			username, profilePhoto                            sql.NullString
-			taggedUsers, location, audience, audienceUserIDs sql.NullString
-			latitude, longitude                              sql.NullFloat64
+			taggedUsers, location, audience, audienceUserIDs  sql.NullString
+			latitude, longitude                               sql.NullFloat64
 			price                                             float64
 			dbUserID                                          int64
-			likeCount, commentCount, views                    int
-			isLiked, isSaved, isLocked                        bool
+			likeCount, commentCount, reshareCount             int
+			isLiked, isSaved, isLocked, isReshared            bool
 		)
 		err := rows.Scan(
 			&postID, &caption, &mediaURL, &mediaType, &postType, &price, &isLocked,
 			&taggedUsers, &location, &latitude, &longitude, &audience, &audienceUserIDs, &createdAt,
 			&dbUserID, &username, &profilePhoto,
 			&likeCount, &commentCount,
-			&isLiked, &isSaved, &views,
+			&isLiked, &isSaved, &isReshared, &reshareCount,
 		)
 		if err != nil {
 			return nil, err
 		}
 		posts = append(posts, map[string]interface{}{
-			"id":           postID,
-			"caption":      caption,
-			"media_url":    mediaURL,
-			"media_type":   mediaType,
-			"post_type":    postType,
-			"price":        price,
-			"is_locked":    isLocked,
-			"tagged_users": taggedUsers.String,
-			"location":     location.String,
-			"latitude":     nullableFloat(latitude),
-			"longitude":    nullableFloat(longitude),
-			"audience":     audience.String,
+			"id":                postID,
+			"caption":           caption,
+			"media_url":         mediaURL,
+			"media_type":        mediaType,
+			"post_type":         postType,
+			"price":             price,
+			"is_locked":         isLocked,
+			"tagged_users":      taggedUsers.String,
+			"location":          location.String,
+			"latitude":          nullableFloat(latitude),
+			"longitude":         nullableFloat(longitude),
+			"audience":          audience.String,
 			"audience_user_ids": audienceUserIDs.String,
-			"created_at":   createdAt,
+			"created_at":        createdAt,
 			"user": map[string]interface{}{
 				"id":            dbUserID,
 				"username":      username.String,
@@ -577,13 +599,17 @@ func scanPostRows(db *sql.DB, rows *sql.Rows) ([]map[string]interface{}, error) 
 			"comment_count": commentCount,
 			"is_liked":      isLiked,
 			"is_saved":      isSaved,
-			"views":         views,
+			"is_reshared":   isReshared,
+			"reshare_count": reshareCount,
 		})
 	}
 	if posts == nil {
 		posts = []map[string]interface{}{}
 	}
 	if err := attachMedia(db, posts); err != nil {
+		return nil, err
+	}
+	if err := AttachTagged(db, posts); err != nil {
 		return nil, err
 	}
 	return posts, nil
@@ -652,6 +678,65 @@ func attachMedia(db *sql.DB, posts []map[string]interface{}) error {
 		mtype, _ := p["media_type"].(string)
 		if url != "" {
 			p["media"] = []map[string]interface{}{{"url": url, "type": mtype}}
+		}
+	}
+	return nil
+}
+
+// AttachTagged resolves each post's comma-separated tagged user IDs (key
+// "tagged_users") into a "tagged" array of {id, username, profile_photo}
+// plus a "tagged_count". Uses one batch query for all posts. Missing/unknown
+// ids are kept as id-only entries so the count still matches the tags shown.
+func AttachTagged(db *sql.DB, posts []map[string]interface{}) error {
+	if len(posts) == 0 {
+		return nil
+	}
+	seen := map[int64]bool{}
+	var ids []int64
+	for _, p := range posts {
+		csv, _ := p["tagged_users"].(string)
+		for _, s := range strings.Split(csv, ",") {
+			id, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+			if err != nil || id == 0 || seen[id] {
+				continue
+			}
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	users := map[int64]map[string]interface{}{}
+	if len(ids) > 0 {
+		rows, err := db.Query(`SELECT id, COALESCE(username,''), COALESCE(profile_photo,'') FROM users WHERE id = ANY($1)`, pq.Array(ids))
+		if err == nil {
+			for rows.Next() {
+				var uid int64
+				var uname, photo string
+				if rows.Scan(&uid, &uname, &photo) == nil {
+					users[uid] = map[string]interface{}{
+						"id": uid, "username": uname, "profile_photo": photo,
+					}
+				}
+			}
+			rows.Close()
+		}
+	}
+	for _, p := range posts {
+		csv, _ := p["tagged_users"].(string)
+		tagged := []map[string]interface{}{}
+		for _, s := range strings.Split(csv, ",") {
+			id, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+			if err != nil || id == 0 {
+				continue
+			}
+			if u, ok := users[id]; ok {
+				tagged = append(tagged, u)
+			} else {
+				tagged = append(tagged, map[string]interface{}{"id": id, "username": "", "profile_photo": ""})
+			}
+		}
+		if len(tagged) > 0 {
+			p["tagged"] = tagged
+			p["tagged_count"] = len(tagged)
 		}
 	}
 	return nil

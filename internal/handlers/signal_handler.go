@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
+	"markethouse/internal/repository"
 	"markethouse/internal/services"
 )
 
@@ -318,6 +319,29 @@ func (h *SignalHandler) GetInterests(c *gin.Context) {
 	c.JSON(200, gin.H{"interests": interests})
 }
 
+// GET /user/interests — the user's explicit (manually picked) category list
+func (h *SignalHandler) GetExplicitInterests(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	c.JSON(200, gin.H{"categories": h.Rec.GetExplicitInterests(userID)})
+}
+
+// POST /user/interests — save the user's manually picked categories
+func (h *SignalHandler) SetExplicitInterests(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	var req struct {
+		Categories []string `json:"categories"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": "body must be {\"categories\": [...]}"})
+		return
+	}
+	if err := h.Rec.SetExplicitInterests(userID, req.Categories); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"ok": true, "categories": req.Categories})
+}
+
 // GET /analytics/business — business dashboard (views, chats, cart, purchases, revenue)
 func (h *SignalHandler) BusinessAnalytics(c *gin.Context) {
 	userID := c.GetInt64("user_id")
@@ -364,7 +388,8 @@ func (h *SignalHandler) fetchPostsByIDs(c *gin.Context, viewerID int64, ids []in
 		SELECT p.id, p.user_id, p.caption, COALESCE(p.media_url,''), COALESCE(p.media_type,'image'),
 		       COALESCE(p.category,''), p.post_type, p.created_at,
 		       u.username, COALESCE(u.profile_photo,''),
-		       COALESCE(p.quality_score,0),
+		       COALESCE(p.quality_score,0), COALESCE(p.views,0),
+		       COALESCE(p.tagged_users,''),
 		       (SELECT COUNT(*) FROM likes WHERE post_id=p.id) as likes,
 		       (SELECT COUNT(*) FROM comments WHERE post_id=p.id) as comments,
 		       EXISTS(SELECT 1 FROM likes WHERE post_id=p.id AND user_id=$1) as is_liked,
@@ -381,21 +406,36 @@ func (h *SignalHandler) fetchPostsByIDs(c *gin.Context, viewerID int64, ids []in
 	var posts []gin.H
 	for rows.Next() {
 		var id, authorID int64
-		var caption, mediaURL, mediaType, category, postType, ca, uname, photo string
-		var qualityScore float64
+		var caption, mediaURL, mediaType, category, postType, ca, uname, photo, taggedUsers string
+		var qualityScore, views float64
 		var likes, comments int64
 		var isLiked, isSaved bool
 		if err := rows.Scan(&id, &authorID, &caption, &mediaURL, &mediaType, &category, &postType, &ca,
-			&uname, &photo, &qualityScore, &likes, &comments, &isLiked, &isSaved); err != nil {
+			&uname, &photo, &qualityScore, &views, &taggedUsers, &likes, &comments, &isLiked, &isSaved); err != nil {
 			continue
 		}
 		posts = append(posts, gin.H{
 			"id": id, "user_id": authorID, "caption": caption,
 			"media_url": mediaURL, "media_type": mediaType, "category": category, "post_type": postType,
 			"created_at": ca, "username": uname, "profile_photo": photo,
-			"quality_score": qualityScore, "like_count": likes, "comment_count": comments,
+			"quality_score": qualityScore, "views": int64(views), "like_count": likes, "comment_count": comments,
 			"is_liked": isLiked, "is_saved": isSaved,
+			"tagged_users": taggedUsers,
 		})
+	}
+	maps := make([]map[string]interface{}, len(posts))
+	for i, p := range posts {
+		maps[i] = p
+	}
+	if err := repository.AttachTagged(h.DB, maps); err == nil {
+		for i, p := range posts {
+			if v, ok := p["tagged"]; ok {
+				posts[i]["tagged"] = v
+				if n, ok2 := p["tagged_count"]; ok2 {
+					posts[i]["tagged_count"] = n
+				}
+			}
+		}
 	}
 	return posts
 }

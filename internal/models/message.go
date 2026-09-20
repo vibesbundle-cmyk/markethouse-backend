@@ -17,8 +17,10 @@ type Message struct {
 	IsStarred      bool       `json:"is_starred"`
 	IsPinned       bool       `json:"is_pinned"`
 	Reaction       *string    `json:"reaction,omitempty"`
+	Reactions      []map[string]interface{} `json:"reactions,omitempty"`
 	IsEdited       bool       `json:"is_edited"`
 	ExpiresAt      *time.Time `json:"expires_at,omitempty"`
 	Latitude       *float64   `json:"latitude,omitempty"`
 	Longitude      *float64   `json:"longitude,omitempty"`
+	IsForwarded    bool       `json:"is_forwarded"`
 }

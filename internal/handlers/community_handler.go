@@ -2,12 +2,14 @@ package handlers
 
 import (
 	"database/sql"
+	"encoding/json"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"markethouse/internal/repository"
 	"markethouse/internal/services"
 
 	"github.com/gin-gonic/gin"
@@ -28,8 +30,20 @@ func (h *CommunityHandler) List(c *gin.Context) {
 		       COALESCE(array_to_string(c.tags,','),''), COALESCE(c.username,''), COALESCE(c.marketplace_enabled,false),
 		       CASE WHEN c.visibility='public' OR $1 > 0 THEN 
 		         COALESCE(EXISTS(SELECT 1 FROM community_members cm WHERE cm.community_id=c.id AND cm.user_id=$1 AND cm.status='active'), false)
-		       ELSE false END AS is_member
+		       ELSE false END AS is_member,
+		       COALESCE((SELECT cmm.body FROM community_messages cmm WHERE cmm.community_id=c.id ORDER BY cmm.id DESC LIMIT 1),'') AS last_message,
+		       COALESCE((SELECT to_char(cmm.created_at,'YYYY-MM-DD"T"HH24:MI:SS"Z"') FROM community_messages cmm WHERE cmm.community_id=c.id ORDER BY cmm.id DESC LIMIT 1),'') AS last_message_at,
+		       COALESCE((SELECT cmm.id FROM community_messages cmm WHERE cmm.community_id=c.id ORDER BY cmm.id DESC LIMIT 1),0) AS last_msg_id,
+		       COALESCE((SELECT lr.last_read_message_id FROM community_members lr WHERE lr.community_id=c.id AND lr.user_id=$1 AND lr.status='active'),0) AS last_read_id,
+		       CASE WHEN $1 > 0 AND EXISTS(SELECT 1 FROM community_members m2 WHERE m2.community_id=c.id AND m2.user_id=$1 AND m2.status='active')
+		         THEN (SELECT COUNT(*) FROM community_messages cmm2 WHERE cmm2.community_id=c.id
+		               AND cmm2.id > COALESCE((SELECT lr2.last_read_message_id FROM community_members lr2
+		                                      WHERE lr2.community_id=c.id AND lr2.user_id=$1 AND lr2.status='active'),0))
+		       ELSE 0 END AS unread_count,
+		       CASE WHEN $1 > 0 AND EXISTS(SELECT 1 FROM community_join_requests jr WHERE jr.community_id=c.id AND jr.user_id=$1 AND jr.status='pending')
+		         THEN true ELSE false END AS is_pending
 		FROM communities c
+		WHERE c.visibility = 'public' OR $1 > 0
 		ORDER BY c.member_count DESC LIMIT 100`, userID)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
@@ -41,15 +55,24 @@ func (h *CommunityHandler) List(c *gin.Context) {
 		var id, mc int64
 		var name, slug, desc, cover, icon, vis, cat, ca, tags, username string
 		var isMember, marketplace bool
-		if err := rows.Scan(&id, &name, &slug, &desc, &cover, &icon, &mc, &vis, &cat, &ca, &tags, &username, &marketplace, &isMember); err != nil {
+		var lastMessage, lastMessageAt string
+		var lastMsgID, lastReadID, unreadCount int64
+		var isPending bool
+		if err := rows.Scan(&id, &name, &slug, &desc, &cover, &icon, &mc, &vis, &cat, &ca, &tags, &username, &marketplace, &isMember, &lastMessage, &lastMessageAt, &lastMsgID, &lastReadID, &unreadCount, &isPending); err != nil {
 			continue
+		}
+		unread := 0
+		if isMember && unreadCount > 0 {
+			unread = int(unreadCount)
 		}
 		list = append(list, gin.H{
 			"id": id, "name": name, "slug": slug, "description": desc,
 			"cover_photo": cover, "icon": icon, "member_count": mc,
 			"visibility": vis, "category": cat, "created_at": ca, "username": username,
-			"marketplace_enabled": marketplace,
+			"marketplace_enabled": marketplace, "is_pending": isPending,
 			"tags":                strings.Split(tags, ","), "is_member": isMember,
+			"last_message": lastMessage, "last_message_at": lastMessageAt,
+			"unread_count": unread, "last_message_id": lastMsgID,
 		})
 	}
 	if list == nil {
@@ -88,6 +111,9 @@ func (h *CommunityHandler) Get(c *gin.Context) {
 func (h *CommunityHandler) GetByID(c *gin.Context) {
 	userID := c.GetInt64("user_id")
 	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	if userID == 0 && !h.communityPublicForGuest(c, commID) {
+		return
+	}
 	var id, mc int64
 	var name, desc, rules, cover, icon, vis, cat, tags, createdAt, username string
 	var isMember, marketplace bool
@@ -95,6 +121,8 @@ func (h *CommunityHandler) GetByID(c *gin.Context) {
 	var slowmode int
 	var blockLinks bool
 	var automodWords string
+	var requireApproval, notifyJoinRequests, isPending bool
+	var membersCanAdd bool
 	err := h.DB.QueryRow(`
 		SELECT c.id, c.name, COALESCE(c.description,''), COALESCE(c.rules,''),
 		       COALESCE(c.cover_photo,''), COALESCE(c.icon,''), c.member_count,
@@ -102,10 +130,14 @@ func (h *CommunityHandler) GetByID(c *gin.Context) {
 		       COALESCE(array_to_string(c.tags,','),''), c.created_at, COALESCE(c.username,''), COALESCE(c.marketplace_enabled,false),
 		       EXISTS(SELECT 1 FROM community_members cm WHERE cm.community_id=c.id AND cm.user_id=$2 AND cm.status='active'),
 		       (SELECT cm.role FROM community_members cm WHERE cm.community_id=c.id AND cm.user_id=$2 AND cm.status='active'),
-		       COALESCE(c.slowmode_seconds,0), COALESCE(c.automod_block_links,false), COALESCE(c.automod_words,'')
+		       COALESCE(c.slowmode_seconds,0), COALESCE(c.automod_block_links,false), COALESCE(c.automod_words,''),
+		       COALESCE(c.require_approval,false), COALESCE(c.notify_join_requests,true),
+		       COALESCE(EXISTS(SELECT 1 FROM community_join_requests jr WHERE jr.community_id=c.id AND jr.user_id=$2 AND jr.status='pending'),false),
+		       COALESCE(c.members_can_add,true)
 		FROM communities c WHERE c.id=$1`, commID, userID).Scan(
 		&id, &name, &desc, &rules, &cover, &icon, &mc, &vis, &cat, &tags, &createdAt, &username, &marketplace,
-		&isMember, &myRole, &slowmode, &blockLinks, &automodWords)
+		&isMember, &myRole, &slowmode, &blockLinks, &automodWords,
+		&requireApproval, &notifyJoinRequests, &isPending, &membersCanAdd)
 	if err != nil {
 		c.JSON(404, gin.H{"error": "not found"})
 		return
@@ -182,6 +214,10 @@ func (h *CommunityHandler) GetByID(c *gin.Context) {
 		"slowmode_seconds":    slowmode,
 		"automod_block_links": blockLinks,
 		"automod_words":       automodWords,
+		"require_approval":    requireApproval,
+		"notify_join_requests":        notifyJoinRequests,
+		"is_pending":                  isPending,
+		"members_can_add":             membersCanAdd,
 		"top_members":         topMembers,
 	}})
 }
@@ -279,14 +315,341 @@ func (h *CommunityHandler) Create(c *gin.Context) {
 func (h *CommunityHandler) Join(c *gin.Context) {
 	userID := c.GetInt64("user_id")
 	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+
+	// Already an active member → nothing to do.
+	if h.getMemberRole(commID, userID) != "" {
+		c.JSON(200, gin.H{"ok": true, "status": "joined"})
+		return
+	}
+
+	// Banned users can't (re)join through this endpoint. We also capture the
+	// previous status so the member_count below only bumps for new members.
+	var prevStatus string
+	h.DB.QueryRow(`SELECT COALESCE(status,'') FROM community_members WHERE community_id=$1 AND user_id=$2`, commID, userID).Scan(&prevStatus)
+	if prevStatus == "banned" {
+		c.JSON(403, gin.H{"error": "you're banned from this community"})
+		return
+	}
+
+	var requireApproval bool
+	h.DB.QueryRow(`SELECT COALESCE(require_approval,false) FROM communities WHERE id=$1`, commID).Scan(&requireApproval)
+
+	// Approval mode → file a join request (or re-file a previously declined one).
+	if requireApproval {
+		h.DB.Exec(`INSERT INTO community_join_requests(community_id,user_id,status) VALUES($1,$2,'pending')
+			ON CONFLICT(community_id,user_id) DO UPDATE SET status='pending', created_at=NOW()`, commID, userID)
+		if h.Hub != nil {
+			h.Hub.Broadcast(map[string]interface{}{
+				"type": "community_join_request", "community_id": commID, "user_id": userID, "status": "pending",
+			})
+		}
+		h.notifyJoinAdmins(commID, userID)
+		c.JSON(200, gin.H{"ok": true, "status": "requested"})
+		return
+	}
+
 	h.DB.Exec(`INSERT INTO community_members(community_id,user_id) VALUES($1,$2)
 		ON CONFLICT(community_id,user_id) DO UPDATE SET status='active'`, commID, userID)
-	h.DB.Exec(`UPDATE communities SET member_count=member_count+1 WHERE id=$1`, commID)
+	// Only bump the counter for genuinely new members ("" = never joined,
+	// "inactive" = left earlier and was already decremented). Muted members
+	// never lost their count, so re-activating them must not double-add.
+	if prevStatus == "" || prevStatus == "inactive" {
+		h.DB.Exec(`UPDATE communities SET member_count=member_count+1 WHERE id=$1`, commID)
+	}
 	if h.Hub != nil {
 		h.Hub.Broadcast(map[string]interface{}{
 			"type": "community_join", "community_id": commID, "user_id": userID, "joined": true,
 		})
 	}
+	c.JSON(200, gin.H{"ok": true, "status": "joined"})
+}
+
+// notifyJoinAdmins pushes a "new join request" notification to every active
+// owner + admin of the community (gated by the notify_join_requests toggle).
+func (h *CommunityHandler) notifyJoinAdmins(commID, requesterID int64) {
+	var notify bool
+	if h.DB.QueryRow(`SELECT COALESCE(notify_join_requests,true) FROM communities WHERE id=$1`, commID).Scan(&notify) != nil || !notify {
+		return
+	}
+	name := userName(h.DB, requesterID)
+	commName := h.communityName(commID)
+	rows, err := h.DB.Query(`SELECT user_id FROM community_members WHERE community_id=$1 AND role IN ('owner','admin') AND status='active'`, commID)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var adminID int64
+		if rows.Scan(&adminID) != nil {
+			continue
+		}
+		NotifyWithWS(h.DB, h.Hub, adminID, requesterID, "community_join_request",
+			"New join request", name+" requested to join "+commName,
+			"community", commID)
+	}
+}
+
+func (h *CommunityHandler) communityName(commID int64) string {
+	var n sql.NullString
+	h.DB.QueryRow(`SELECT name FROM communities WHERE id=$1`, commID).Scan(&n)
+	if n.Valid {
+		return n.String
+	}
+	return "your community"
+}
+
+// ── Join request management ──────────────────────────────────────────────────
+// GetJoinRequests returns the pending join requests (owner/admin only).
+func (h *CommunityHandler) GetJoinRequests(c *gin.Context) {
+	callerID := c.GetInt64("user_id")
+	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	if !canManageRoles(h.getMemberRole(commID, callerID)) {
+		c.JSON(403, gin.H{"error": "only the owner or an admin can view join requests"})
+		return
+	}
+	rows, err := h.DB.Query(`
+		SELECT cjr.id, cjr.user_id, u.username, COALESCE(u.full_name,''), COALESCE(u.profile_photo,''),
+		       to_char(cjr.created_at,'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		FROM community_join_requests cjr
+		JOIN users u ON u.id = cjr.user_id
+		WHERE cjr.community_id=$1 AND cjr.status='pending'
+		ORDER BY cjr.created_at ASC`, commID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+	var list []gin.H
+	for rows.Next() {
+		var id, uid int64
+		var uname, fname, photo, createdAt string
+		if rows.Scan(&id, &uid, &uname, &fname, &photo, &createdAt) != nil {
+			continue
+		}
+		list = append(list, gin.H{
+			"id": id, "user_id": uid, "username": uname, "full_name": fname,
+			"profile_photo": photo, "created_at": createdAt,
+		})
+	}
+	if list == nil {
+		list = []gin.H{}
+	}
+	c.JSON(200, gin.H{"requests": list})
+}
+
+// ApproveJoinRequest activates a pending join request and notifies the user.
+func (h *CommunityHandler) ApproveJoinRequest(c *gin.Context) {
+	callerID := c.GetInt64("user_id")
+	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	reqID, _ := strconv.ParseInt(c.Param("reqId"), 10, 64)
+	if !canManageRoles(h.getMemberRole(commID, callerID)) {
+		c.JSON(403, gin.H{"error": "only the owner or an admin can approve join requests"})
+		return
+	}
+	var requesterID int64
+	if err := h.DB.QueryRow(`SELECT user_id FROM community_join_requests WHERE id=$1 AND community_id=$2 AND status='pending'`, reqID, commID).Scan(&requesterID); err != nil {
+		c.JSON(404, gin.H{"error": "request not found"})
+		return
+	}
+	var prevStatus string
+	h.DB.QueryRow(`SELECT COALESCE(status,'') FROM community_members WHERE community_id=$1 AND user_id=$2`, commID, requesterID).Scan(&prevStatus)
+	h.DB.Exec(`INSERT INTO community_members(community_id,user_id) VALUES($1,$2)
+		ON CONFLICT(community_id,user_id) DO UPDATE SET status='active'`, commID, requesterID)
+	if prevStatus == "" || prevStatus == "inactive" {
+		h.DB.Exec(`UPDATE communities SET member_count=member_count+1 WHERE id=$1`, commID)
+	}
+	h.DB.Exec(`DELETE FROM community_join_requests WHERE id=$1`, reqID)
+	if h.Hub != nil {
+		h.Hub.Broadcast(map[string]interface{}{
+			"type": "community_join_request", "community_id": commID, "user_id": requesterID, "status": "approved",
+		})
+	}
+	NotifyWithWS(h.DB, h.Hub, requesterID, callerID, "community_join_request",
+		"You've joined", "Your request to join "+h.communityName(commID)+" was approved",
+		"community", commID)
+	c.JSON(200, gin.H{"ok": true})
+}
+
+// DeclineJoinRequest marks a pending request as declined so the user can retry.
+func (h *CommunityHandler) DeclineJoinRequest(c *gin.Context) {
+	callerID := c.GetInt64("user_id")
+	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	reqID, _ := strconv.ParseInt(c.Param("reqId"), 10, 64)
+	if !canManageRoles(h.getMemberRole(commID, callerID)) {
+		c.JSON(403, gin.H{"error": "only the owner or an admin can decline join requests"})
+		return
+	}
+	var requesterID int64
+	if err := h.DB.QueryRow(`SELECT user_id FROM community_join_requests WHERE id=$1 AND community_id=$2 AND status='pending'`, reqID, commID).Scan(&requesterID); err != nil {
+		c.JSON(404, gin.H{"error": "request not found"})
+		return
+	}
+	h.DB.Exec(`UPDATE community_join_requests SET status='declined' WHERE id=$1`, reqID)
+	if h.Hub != nil {
+		h.Hub.Broadcast(map[string]interface{}{
+			"type": "community_join_request", "community_id": commID, "user_id": requesterID, "status": "declined",
+		})
+	}
+	c.JSON(200, gin.H{"ok": true})
+}
+
+// ── Admin / Owner management (max 3 each) ────────────────────────────────────
+func (h *CommunityHandler) GetAdmins(c *gin.Context) {
+	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	if _, err := h.DB.Exec(`SELECT 1 FROM communities WHERE id=$1`, commID); err != nil {
+		c.JSON(404, gin.H{"error": "community not found"})
+		return
+	}
+	rows, err := h.DB.Query(`
+		SELECT u.id, u.username, COALESCE(u.full_name,''), COALESCE(u.profile_photo,''), cm.role
+		FROM community_members cm JOIN users u ON u.id=cm.user_id
+		WHERE cm.community_id=$1 AND cm.role IN ('owner','admin') AND cm.status='active'
+		ORDER BY cm.joined_at ASC`, commID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+	owners, admins := []gin.H{}, []gin.H{}
+	for rows.Next() {
+		var uid int64
+		var uname, fname, photo, role string
+		if rows.Scan(&uid, &uname, &fname, &photo, &role) != nil {
+			continue
+		}
+		entry := gin.H{"user_id": uid, "username": uname, "full_name": fname, "profile_photo": photo}
+		if role == "owner" {
+			owners = append(owners, entry)
+		} else {
+			admins = append(admins, entry)
+		}
+	}
+	c.JSON(200, gin.H{"owners": owners, "admins": admins})
+}
+
+func (h *CommunityHandler) AddAdmin(c *gin.Context) {
+	callerID := c.GetInt64("user_id")
+	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	if h.getMemberRole(commID, callerID) != "owner" {
+		c.JSON(403, gin.H{"error": "only the community owner can add admins"})
+		return
+	}
+	var req struct {
+		UserID int64 `json:"user_id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.UserID <= 0 {
+		c.JSON(400, gin.H{"error": "user_id required"})
+		return
+	}
+	targetRole := h.getMemberRole(commID, req.UserID)
+	if targetRole == "" {
+		c.JSON(400, gin.H{"error": "the user must be a member of this community"})
+		return
+	}
+	if targetRole == "owner" {
+		c.JSON(400, gin.H{"error": "the owner already manages this community"})
+		return
+	}
+	if targetRole == "admin" {
+		c.JSON(400, gin.H{"error": "the user is already an admin"})
+		return
+	}
+	var adminCount int
+	h.DB.QueryRow(`SELECT COUNT(*) FROM community_members WHERE community_id=$1 AND role='admin' AND status='active'`, commID).Scan(&adminCount)
+	if adminCount >= 3 {
+		c.JSON(400, gin.H{"error": "a community can have at most 3 admins"})
+		return
+	}
+	h.DB.Exec(`UPDATE community_members SET role='admin' WHERE community_id=$1 AND user_id=$2`, commID, req.UserID)
+	c.JSON(200, gin.H{"ok": true})
+}
+
+func (h *CommunityHandler) RemoveAdmin(c *gin.Context) {
+	callerID := c.GetInt64("user_id")
+	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	targetID, _ := strconv.ParseInt(c.Param("userId"), 10, 64)
+	if h.getMemberRole(commID, callerID) != "owner" {
+		c.JSON(403, gin.H{"error": "only the community owner can remove admins"})
+		return
+	}
+	if h.getMemberRole(commID, targetID) == "admin" {
+		h.DB.Exec(`UPDATE community_members SET role='member' WHERE community_id=$1 AND user_id=$2`, commID, targetID)
+	}
+	c.JSON(200, gin.H{"ok": true})
+}
+
+func (h *CommunityHandler) AddOwner(c *gin.Context) {
+	callerID := c.GetInt64("user_id")
+	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	if h.getMemberRole(commID, callerID) != "owner" {
+		c.JSON(403, gin.H{"error": "only the owner can add owners"})
+		return
+	}
+	var req struct {
+		UserID int64 `json:"user_id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.UserID <= 0 {
+		c.JSON(400, gin.H{"error": "user_id required"})
+		return
+	}
+	targetRole := h.getMemberRole(commID, req.UserID)
+	if targetRole == "" {
+		c.JSON(400, gin.H{"error": "the user must be a member of this community"})
+		return
+	}
+	if targetRole == "owner" {
+		c.JSON(400, gin.H{"error": "the user is already an owner"})
+		return
+	}
+	var ownerCount int
+	h.DB.QueryRow(`SELECT COUNT(*) FROM community_members WHERE community_id=$1 AND role='owner' AND status='active'`, commID).Scan(&ownerCount)
+	if ownerCount >= 3 {
+		c.JSON(400, gin.H{"error": "a community can have at most 3 owners"})
+		return
+	}
+	h.DB.Exec(`UPDATE community_members SET role='owner' WHERE community_id=$1 AND user_id=$2`, commID, req.UserID)
+	c.JSON(200, gin.H{"ok": true})
+}
+
+// ── Join settings ────────────────────────────────────────────────────────────
+func (h *CommunityHandler) GetJoinSettings(c *gin.Context) {
+	callerID := c.GetInt64("user_id")
+	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	if !canManageRoles(h.getMemberRole(commID, callerID)) {
+		c.JSON(403, gin.H{"error": "only the owner or an admin can view join settings"})
+		return
+	}
+	var requireApproval, notifyJoin bool
+	h.DB.QueryRow(`SELECT COALESCE(require_approval,false), COALESCE(notify_join_requests,true) FROM communities WHERE id=$1`, commID).Scan(&requireApproval, &notifyJoin)
+	c.JSON(200, gin.H{"require_approval": requireApproval, "notify_join_requests": notifyJoin})
+}
+
+func (h *CommunityHandler) UpdateJoinSettings(c *gin.Context) {
+	callerID := c.GetInt64("user_id")
+	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	if !canManageRoles(h.getMemberRole(commID, callerID)) {
+		c.JSON(403, gin.H{"error": "only the owner or an admin can change join settings"})
+		return
+	}
+	var req struct {
+		RequireApproval    *bool `json:"require_approval"`
+		NotifyJoinRequests *bool `json:"notify_join_requests"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	raSet, nirSet, ra, nir := false, false, false, false
+	if req.RequireApproval != nil {
+		raSet, ra = true, *req.RequireApproval
+	}
+	if req.NotifyJoinRequests != nil {
+		nirSet, nir = true, *req.NotifyJoinRequests
+	}
+	h.DB.Exec(`UPDATE communities SET
+		require_approval=CASE WHEN $1 THEN $2 ELSE require_approval END,
+		notify_join_requests=CASE WHEN $3 THEN $4 ELSE notify_join_requests END
+		WHERE id=$5`, raSet, ra, nirSet, nir, commID)
 	c.JSON(200, gin.H{"ok": true})
 }
 
@@ -296,6 +659,7 @@ func (h *CommunityHandler) Leave(c *gin.Context) {
 	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
 	h.DB.Exec(`UPDATE community_members SET status='inactive' WHERE community_id=$1 AND user_id=$2`, commID, userID)
 	h.DB.Exec(`UPDATE communities SET member_count=GREATEST(0,member_count-1) WHERE id=$1`, commID)
+	h.DB.Exec(`DELETE FROM community_join_requests WHERE community_id=$1 AND user_id=$2 AND status='pending'`, commID, userID)
 	if h.Hub != nil {
 		h.Hub.Broadcast(map[string]interface{}{
 			"type": "community_join", "community_id": commID, "user_id": userID, "joined": false,
@@ -339,9 +703,24 @@ func (h *CommunityHandler) Delete(c *gin.Context) {
 }
 
 // ── Get posts ────────────────────────────────────────────────────────────────
+// communityPublicForGuest rejects guest (user_id = 0) reads of private
+// communities. Returns false when it already wrote the 403 response.
+func (h *CommunityHandler) communityPublicForGuest(c *gin.Context, commID int64) bool {
+	var visibility string
+	err := h.DB.QueryRow(`SELECT COALESCE(visibility,'public') FROM communities WHERE id=$1`, commID).Scan(&visibility)
+	if err != nil || visibility != "public" {
+		c.JSON(403, gin.H{"error": "private community"})
+		return false
+	}
+	return true
+}
+
 func (h *CommunityHandler) GetPosts(c *gin.Context) {
 	userID := c.GetInt64("user_id")
 	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	if userID == 0 && !h.communityPublicForGuest(c, commID) {
+		return
+	}
 	sort := c.DefaultQuery("sort", "hot")
 	orderBy := "cp.created_at DESC"
 	switch sort {
@@ -354,11 +733,13 @@ func (h *CommunityHandler) GetPosts(c *gin.Context) {
 	}
 	rows, err := h.DB.Query(`
 		SELECT cp.id, cp.user_id, cp.post_type, cp.title, COALESCE(cp.body,''), COALESCE(cp.media_url,''),
-		       COALESCE(cp.link_url,''), cp.upvotes, cp.downvotes, cp.comment_count,
+		       COALESCE(cp.media_type,''), COALESCE(cp.link_url,''), cp.upvotes, cp.downvotes, cp.comment_count,
 		       cp.is_pinned, cp.is_locked, cp.created_at,
 		       u.username, COALESCE(u.profile_photo,''),
 		       COALESCE((SELECT vote FROM community_votes WHERE post_id=cp.id AND user_id=$2),0),
-		       COALESCE(cp.best_answer_id, 0), cp.poll_ends_at, COALESCE(cp.poll_multiple,false), COALESCE(cp.poll_anonymous,false)
+		       COALESCE(cp.best_answer_id, 0), cp.poll_ends_at, COALESCE(cp.poll_multiple,false), COALESCE(cp.poll_anonymous,false),
+		       COALESCE(cp.background_color,''), COALESCE(cp.poll_allow_ideas,false), COALESCE(cp.tagged_users,''),
+		       COALESCE(cp.music_title,''), COALESCE(cp.music_url,'')
 		FROM community_posts cp
 		JOIN users u ON u.id=cp.user_id
 		WHERE cp.community_id=$1
@@ -373,28 +754,37 @@ func (h *CommunityHandler) GetPosts(c *gin.Context) {
 	byID := map[int64]gin.H{}
 	for rows.Next() {
 		var id, authorID, up, dw, cc, bestAnswerID int64
-		var pt, title, body, media, link, ca, uname, uphoto string
+		var pt, title, body, media, mediaType, link, ca, uname, uphoto, bgColor, taggedUsers string
+		var musicTitle, musicURL string
 		var pinned, locked, pollMultiple, pollAnon bool
 		var myVote int
+		var allowIdeas bool
 		var pollEndsAt sql.NullTime
-		if err := rows.Scan(&id, &authorID, &pt, &title, &body, &media, &link, &up, &dw, &cc, &pinned, &locked, &ca,
-			&uname, &uphoto, &myVote, &bestAnswerID, &pollEndsAt, &pollMultiple, &pollAnon); err != nil {
+		if err := rows.Scan(&id, &authorID, &pt, &title, &body, &media, &mediaType, &link, &up, &dw, &cc, &pinned, &locked, &ca,
+			&uname, &uphoto, &myVote, &bestAnswerID, &pollEndsAt, &pollMultiple, &pollAnon, &bgColor, &allowIdeas, &taggedUsers, &musicTitle, &musicURL); err != nil {
 			continue
 		}
 		var endsAt interface{}
 		if pollEndsAt.Valid {
 			endsAt = pollEndsAt.Time
 		}
+		if mediaType == "" {
+			mediaType = "image"
+		}
 		p := gin.H{
 			"id": id, "user_id": authorID, "post_type": pt, "title": title, "body": body,
-			"media_url": media, "link_url": link,
+			"media_url": media, "media_type": mediaType, "link_url": link, "background_color": bgColor,
 			"upvotes": up, "downvotes": dw, "comment_count": cc,
 			"is_pinned": pinned, "is_locked": locked, "created_at": ca,
 			"username": uname, "profile_photo": uphoto, "my_vote": myVote,
 			"best_answer_id": bestAnswerID, "poll_ends_at": endsAt,
-			"poll_multiple": pollMultiple, "poll_anonymous": pollAnon,
-		}
-		posts = append(posts, p)
+		"poll_multiple": pollMultiple, "poll_anonymous": pollAnon,
+		"poll_allow_ideas": allowIdeas,
+		"tagged_users": taggedUsers,
+		"music_title": musicTitle, "music_url": musicURL,
+	}
+		p["media"] = communityMediaItems(media, mediaType)
+	posts = append(posts, p)
 		byID[id] = p
 		if pt == "poll" {
 			postIDs = append(postIDs, id)
@@ -405,6 +795,26 @@ func (h *CommunityHandler) GetPosts(c *gin.Context) {
 	}
 	if len(postIDs) > 0 {
 		h.attachPollOptions(postIDs, userID, byID)
+	}
+	// Attach mentions for all posts
+	for _, p := range posts {
+		if id, ok := p["id"].(int64); ok {
+			h.attachMentions(id, p)
+		}
+	}
+	tagMaps := make([]map[string]interface{}, len(posts))
+	for i, p := range posts {
+		tagMaps[i] = p
+	}
+	if repository.AttachTagged(h.DB, tagMaps) == nil {
+		for i, p := range posts {
+			if v, ok := p["tagged"]; ok {
+				posts[i]["tagged"] = v
+				if n, ok2 := p["tagged_count"]; ok2 {
+					posts[i]["tagged_count"] = n
+				}
+			}
+		}
 	}
 	c.JSON(200, gin.H{"posts": posts})
 }
@@ -445,16 +855,23 @@ func (h *CommunityHandler) attachPollOptions(postIDs []int64, userID int64, byID
 func (h *CommunityHandler) CreatePost(c *gin.Context) {
 	userID := c.GetInt64("user_id")
 	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
-	var req struct {
+var req struct {
 		PostType        string   `json:"post_type"`
 		Title           string   `json:"title"`
 		Body            string   `json:"body"`
 		MediaURL        string   `json:"media_url"`
+		Media           []string `json:"media"`
+		MediaType       string   `json:"media_type"`
 		LinkURL         string   `json:"link_url"`
+		BackgroundColor string   `json:"background_color"`
+		MusicTitle      string   `json:"music_title"`
+		MusicURL        string   `json:"music_url"`
 		PollOptions     []string `json:"poll_options"`
 		PollDurationHrs int      `json:"poll_duration_hours"`
 		PollMultiple    bool     `json:"poll_multiple"`
 		PollAnonymous   bool     `json:"poll_anonymous"`
+		PollAllowIdeas  bool     `json:"poll_allow_ideas"`
+		TaggedUserIDs   []int64  `json:"tagged_user_ids"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
@@ -467,6 +884,24 @@ func (h *CommunityHandler) CreatePost(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "a poll needs at least 2 options"})
 		return
 	}
+	if len(req.Media) > 0 {
+		b, err := json.Marshal(req.Media)
+		if err == nil {
+			req.MediaURL = string(b)
+		}
+		req.MediaType = "image"
+		for _, u := range req.Media {
+			if isVideoURL(u) {
+				req.MediaType = "video"
+				break
+			}
+		}
+	} else if req.MediaType == "" && req.MediaURL != "" {
+		req.MediaType = "image"
+		if isVideoURL(req.MediaURL) {
+			req.MediaType = "video"
+		}
+	}
 
 	var pollEndsAt interface{}
 	if req.PostType == "poll" {
@@ -477,12 +912,14 @@ func (h *CommunityHandler) CreatePost(c *gin.Context) {
 		pollEndsAt = time.Now().Add(time.Duration(hours) * time.Hour)
 	}
 
+	taggedCSV := formatTaggedCSV(req.TaggedUserIDs)
+
 	var id int64
 	err := h.DB.QueryRow(
-		`INSERT INTO community_posts(community_id,user_id,post_type,title,body,media_url,link_url,poll_ends_at,poll_multiple,poll_anonymous)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
-		commID, userID, req.PostType, req.Title, req.Body, req.MediaURL, req.LinkURL,
-		pollEndsAt, req.PollMultiple, req.PollAnonymous).Scan(&id)
+		`INSERT INTO community_posts(community_id,user_id,post_type,title,body,media_url,media_type,link_url,background_color,music_title,music_url,poll_ends_at,poll_multiple,poll_anonymous,poll_allow_ideas,tagged_users)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`,
+		commID, userID, req.PostType, req.Title, req.Body, req.MediaURL, req.MediaType, req.LinkURL, req.BackgroundColor,
+		req.MusicTitle, req.MusicURL, pollEndsAt, req.PollMultiple, req.PollAnonymous, req.PollAllowIdeas, taggedCSV).Scan(&id)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -499,7 +936,144 @@ func (h *CommunityHandler) CreatePost(c *gin.Context) {
 
 	h.DB.Exec(`UPDATE communities SET post_count=post_count+1 WHERE id=$1`, commID)
 
+	h.saveMentions(id, req.Body)
+	h.notifyTaggedMembers(c, commID, userID, id, req.Title, req.TaggedUserIDs)
+
 	c.JSON(200, gin.H{"id": id})
+}
+
+// formatTaggedCSV joins tagged user ids into the comma-separated form stored
+// in community_posts.tagged_users (mirrors posts.tagged_users).
+func formatTaggedCSV(ids []int64) string {
+	var parts []string
+	for _, id := range ids {
+		if id > 0 {
+			parts = append(parts, strconv.FormatInt(id, 10))
+		}
+	}
+	return strings.Join(parts, ",")
+}
+
+// isVideoURL reports whether a media URL looks like a video file.
+func isVideoURL(url string) bool {
+	l := strings.ToLower(url)
+	return strings.HasSuffix(l, ".mp4") || strings.HasSuffix(l, ".mov") ||
+		strings.HasSuffix(l, ".webm") || strings.HasSuffix(l, ".m4v")
+}
+
+// communityMediaItems expands a stored media_url into the media[] items sent to
+// clients. media_url holds either a single URL or a JSON array of URLs (for
+// multi-media posts created with the Media field).
+func communityMediaItems(media, mediaType string) []gin.H {
+	if media == "" {
+		return []gin.H{}
+	}
+	if strings.HasPrefix(media, "[") {
+		var urls []string
+		if err := json.Unmarshal([]byte(media), &urls); err == nil {
+			items := []gin.H{}
+			for _, u := range urls {
+				if u == "" {
+					continue
+				}
+				items = append(items, gin.H{"url": u, "type": communityMediaType(u, mediaType)})
+			}
+			if len(items) > 0 {
+				return items
+			}
+		}
+	}
+	return []gin.H{{"url": media, "type": communityMediaType(media, mediaType)}}
+}
+
+// communityMediaType resolves the media type for a URL, falling back to the
+// post-wide media_type when the URL gives no hint.
+func communityMediaType(url, fallback string) string {
+	if isVideoURL(url) || fallback == "video" {
+		return "video"
+	}
+	return "image"
+}
+
+// notifyTaggedMembers notifies each tagged member (respecting their in-
+// community "allow tagging" opt-out) that they were tagged in a post.
+func (h *CommunityHandler) notifyTaggedMembers(c *gin.Context, commID, actorID, postID int64, title string, ids []int64) {
+	if len(ids) == 0 {
+		return
+	}
+	for _, uid := range ids {
+		if uid == actorID {
+			continue
+		}
+		if !h.memberAllowsTagging(commID, uid) {
+			continue
+		}
+		NotifyWithWS(h.DB, h.Hub, uid, actorID, "community_tag",
+			"@"+userName(h.DB, actorID)+" tagged you in a post", title, "community_post", postID)
+	}
+}
+
+// memberAllowsTagging reports whether a member has opted out of being tagged
+// in this community. Missing row (or nil db) defaults to "allowed".
+func (h *CommunityHandler) memberAllowsTagging(commID, userID int64) bool {
+	if h.DB == nil {
+		return true
+	}
+	var ok bool
+	if err := h.DB.QueryRow(`SELECT COALESCE(allow_tagging,true) FROM community_tag_settings WHERE community_id=$1 AND user_id=$2`, commID, userID).Scan(&ok); err != nil {
+		return true
+	}
+	return ok
+}
+
+// GetTagSettings returns the caller's "allow tagging" setting in a community.
+func (h *CommunityHandler) GetTagSettings(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	var allow bool
+	if err := h.DB.QueryRow(`SELECT COALESCE(allow_tagging,true) FROM community_tag_settings WHERE community_id=$1 AND user_id=$2`, commID, userID).Scan(&allow); err != nil {
+		allow = true
+	}
+	c.JSON(200, gin.H{"allow_tagging": allow})
+}
+
+// UpdateTagSettings upserts the caller's "allow tagging" setting.
+func (h *CommunityHandler) UpdateTagSettings(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	var req struct {
+		AllowTagging *bool `json:"allow_tagging"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.AllowTagging == nil {
+		c.JSON(400, gin.H{"error": "allow_tagging required"})
+		return
+	}
+	h.DB.Exec(`INSERT INTO community_tag_settings(community_id, user_id, allow_tagging) VALUES($1,$2,$3)
+		ON CONFLICT (community_id, user_id) DO UPDATE SET allow_tagging=EXCLUDED.allow_tagging, updated_at=NOW()`,
+		commID, userID, *req.AllowTagging)
+	c.JSON(200, gin.H{"allow_tagging": *req.AllowTagging})
+}
+
+func (h *CommunityHandler) saveMentions(postID int64, body string) {
+	// Parse @username mentions
+	re := regexp.MustCompile(`@([a-zA-Z0-9_]+)`)
+	matches := re.FindAllStringSubmatch(body, -1)
+	seen := map[string]bool{}
+	for _, m := range matches {
+		if len(m) < 2 {
+			continue
+		}
+		username := m[1]
+		if seen[username] {
+			continue
+		}
+		seen[username] = true
+		var uid int64
+		err := h.DB.QueryRow(`SELECT id FROM users WHERE username=$1`, username).Scan(&uid)
+		if err == nil && uid > 0 {
+			h.DB.Exec(`INSERT INTO community_post_mentions(post_id, user_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, postID, uid)
+		}
+	}
 }
 
 // ── Vote on a poll ────────────────────────────────────────────────────────────
@@ -540,6 +1114,178 @@ func (h *CommunityHandler) VotePoll(c *gin.Context) {
 		(SELECT COUNT(*) FROM community_poll_votes WHERE option_id=community_poll_options.id)
 		WHERE post_id=$1`, postID)
 	c.JSON(200, gin.H{"ok": true})
+}
+
+// ── Add poll option (user-submitted "idea") ──────────────────────────────────
+func (h *CommunityHandler) AddPollOption(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	postID, _ := strconv.ParseInt(c.Param("post_id"), 10, 64)
+	var req struct {
+		Text string `json:"text"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Text) == "" {
+		c.JSON(400, gin.H{"error": "text is required"})
+		return
+	}
+	// Check that the post is a poll and allows ideas
+	var postType string
+	var allowIdeas bool
+	if err := h.DB.QueryRow(`SELECT post_type, COALESCE(poll_allow_ideas,false) FROM community_posts WHERE id=$1`, postID).Scan(&postType, &allowIdeas); err != nil || postType != "poll" {
+		c.JSON(400, gin.H{"error": "not a poll"})
+		return
+	}
+	if !allowIdeas {
+		c.JSON(400, gin.H{"error": "this poll does not accept new ideas"})
+		return
+	}
+	// Max 1 idea per user per poll
+	var cnt int
+	h.DB.QueryRow(`SELECT COUNT(*) FROM community_poll_options WHERE post_id=$1 AND added_by=$2`, postID, userID).Scan(&cnt)
+	if cnt > 0 {
+		c.JSON(400, gin.H{"error": "you can only add one idea per poll"})
+		return
+	}
+	// Get current max position
+	var maxPos int
+	h.DB.QueryRow(`SELECT COALESCE(MAX(position),-1) FROM community_poll_options WHERE post_id=$1`, postID).Scan(&maxPos)
+	_, err := h.DB.Exec(`INSERT INTO community_poll_options(post_id, option_text, position, added_by) VALUES($1,$2,$3,$4)`,
+		postID, strings.TrimSpace(req.Text), maxPos+1, userID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"ok": true})
+}
+
+// ── Get poll voters ────────────────────────────────────────────────────────────
+func (h *CommunityHandler) GetPollVoters(c *gin.Context) {
+	postID, _ := strconv.ParseInt(c.Param("post_id"), 10, 64)
+	optionID, _ := strconv.ParseInt(c.Param("option_id"), 10, 64)
+
+	// Verify the option belongs to the post
+	var optPostID int64
+	err := h.DB.QueryRow(`SELECT post_id FROM community_poll_options WHERE id=$1`, optionID).Scan(&optPostID)
+	if err != nil || optPostID != postID {
+		c.JSON(404, gin.H{"error": "option not found"})
+		return
+	}
+
+	rows, err := h.DB.Query(`
+		SELECT u.id, u.username, u.profile_photo, u.full_name
+		FROM community_poll_votes v
+		JOIN users u ON u.id = v.user_id
+		WHERE v.option_id = $1`, optionID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	var voters []gin.H
+	for rows.Next() {
+		var uid int64
+		var username, photo, fullName string
+		if rows.Scan(&uid, &username, &photo, &fullName) != nil {
+			continue
+		}
+		voters = append(voters, gin.H{
+			"id": uid, "username": username, "profile_photo": photo, "full_name": fullName,
+		})
+	}
+	c.JSON(200, gin.H{"voters": voters})
+}
+
+// ── Get single post (with poll options) ──────────────────────────────────────
+func (h *CommunityHandler) GetPost(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	postID, _ := strconv.ParseInt(c.Param("post_id"), 10, 64)
+	if userID == 0 {
+		var isPublic bool
+		h.DB.QueryRow(`
+			SELECT COALESCE(c.visibility,'public')='public' FROM community_posts cp
+			JOIN communities c ON c.id = cp.community_id WHERE cp.id=$1`, postID).Scan(&isPublic)
+		if !isPublic {
+			c.JSON(403, gin.H{"error": "private community"})
+			return
+		}
+	}
+	var id, authorID, up, dw, cc, bestAnswerID int64
+	var pt, title, body, media, mediaType, link, ca, uname, uphoto, bgColor, taggedUsers string
+	var musicTitle, musicURL string
+	var pinned, locked, pollMultiple, pollAnon bool
+	var myVote int
+	var allowIdeas bool
+	var pollEndsAt sql.NullTime
+	err := h.DB.QueryRow(`
+		SELECT cp.id, cp.user_id, cp.post_type, cp.title, COALESCE(cp.body,''), COALESCE(cp.media_url,''),
+		       COALESCE(cp.media_type,''), COALESCE(cp.link_url,''), cp.upvotes, cp.downvotes, cp.comment_count,
+		       cp.is_pinned, cp.is_locked, cp.created_at,
+		       u.username, COALESCE(u.profile_photo,''),
+		       COALESCE((SELECT vote FROM community_votes WHERE post_id=cp.id AND user_id=$2),0),
+		       COALESCE(cp.best_answer_id, 0), cp.poll_ends_at, COALESCE(cp.poll_multiple,false), COALESCE(cp.poll_anonymous,false),
+		       COALESCE(cp.background_color,''), COALESCE(cp.poll_allow_ideas,false), COALESCE(cp.tagged_users,''),
+		       COALESCE(cp.music_title,''), COALESCE(cp.music_url,'')
+		FROM community_posts cp
+		JOIN users u ON u.id=cp.user_id
+		WHERE cp.id=$1`, postID, userID).Scan(&id, &authorID, &pt, &title, &body, &media, &mediaType, &link, &up, &dw, &cc, &pinned, &locked, &ca,
+		&uname, &uphoto, &myVote, &bestAnswerID, &pollEndsAt, &pollMultiple, &pollAnon, &bgColor, &allowIdeas, &taggedUsers, &musicTitle, &musicURL)
+	if err != nil {
+		c.JSON(404, gin.H{"error": "post not found"})
+		return
+	}
+	var endsAt interface{}
+	if pollEndsAt.Valid {
+		endsAt = pollEndsAt.Time
+	}
+	if mediaType == "" {
+		mediaType = "image"
+	}
+	mediaArr := communityMediaItems(media, mediaType)
+	p := gin.H{
+		"id": id, "user_id": authorID, "post_type": pt, "title": title, "body": body,
+		"media_url": media, "media_type": mediaType, "link_url": link, "background_color": bgColor,
+		"upvotes": up, "downvotes": dw, "comment_count": cc,
+		"is_pinned": pinned, "is_locked": locked, "created_at": ca,
+		"username": uname, "profile_photo": uphoto, "my_vote": myVote,
+		"best_answer_id": bestAnswerID, "poll_ends_at": endsAt,
+		"poll_multiple": pollMultiple, "poll_anonymous": pollAnon,
+		"poll_allow_ideas": allowIdeas,
+		"tagged_users": taggedUsers,
+		"music_title":   musicTitle,
+		"music_url":     musicURL,
+		"poll_options": []gin.H{},
+		"media":        mediaArr,
+	}
+	if pt == "poll" {
+		h.attachPollOptions([]int64{id}, userID, map[int64]gin.H{id: p})
+	}
+	h.attachMentions(id, p)
+	repository.AttachTagged(h.DB, []map[string]interface{}{p})
+	c.JSON(200, p)
+}
+
+func (h *CommunityHandler) attachMentions(postID int64, p gin.H) {
+	rows, err := h.DB.Query(`
+		SELECT u.id, u.username, u.profile_photo
+		FROM community_post_mentions m
+		JOIN users u ON u.id = m.user_id
+		WHERE m.post_id = $1`, postID)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	var mentions []gin.H
+	for rows.Next() {
+		var uid int64
+		var username, photo string
+		if rows.Scan(&uid, &username, &photo) != nil {
+			continue
+		}
+		mentions = append(mentions, gin.H{
+			"id": uid, "username": username, "profile_photo": photo,
+		})
+	}
+	p["mentions"] = mentions
 }
 
 // ── Vote ─────────────────────────────────────────────────────────────────────
@@ -583,7 +1329,9 @@ func (h *CommunityHandler) GetComments(c *gin.Context) {
 	rows, err := h.DB.Query(`
 		SELECT cc.id, cc.user_id, COALESCE(cc.parent_id, 0), cc.body, cc.upvotes, cc.created_at,
 		       COALESCE(cc.is_best_answer,false), u.username, COALESCE(u.profile_photo,''),
-		       EXISTS(SELECT 1 FROM community_comment_likes ccl WHERE ccl.comment_id=cc.id AND ccl.user_id=$2)
+		       COALESCE(u.full_name,''),
+		       EXISTS(SELECT 1 FROM community_comment_likes ccl WHERE ccl.comment_id=cc.id AND ccl.user_id=$2),
+		       (SELECT COUNT(*) FROM community_comments r WHERE r.parent_id=cc.id AND COALESCE(r.is_deleted,false)=false)
 		FROM community_comments cc
 		JOIN users u ON u.id=cc.user_id
 		WHERE cc.post_id=$1 AND COALESCE(cc.is_deleted,false)=false
@@ -595,16 +1343,16 @@ func (h *CommunityHandler) GetComments(c *gin.Context) {
 	defer rows.Close()
 	var comments []gin.H
 	for rows.Next() {
-		var id, authorID, pid, up int64
-		var body, ca, uname, photo string
+		var id, authorID, pid, up, replyCount int64
+		var body, ca, uname, photo, fullName string
 		var isBest, likedByMe bool
-		if err := rows.Scan(&id, &authorID, &pid, &body, &up, &ca, &isBest, &uname, &photo, &likedByMe); err != nil {
+		if err := rows.Scan(&id, &authorID, &pid, &body, &up, &ca, &isBest, &uname, &photo, &fullName, &likedByMe, &replyCount); err != nil {
 			continue
 		}
 		comments = append(comments, gin.H{
 			"id": id, "user_id": authorID, "parent_id": pid, "body": body, "upvotes": up,
 			"created_at": ca, "is_best_answer": isBest, "username": uname, "profile_photo": photo,
-			"liked_by_me": likedByMe,
+			"full_name": fullName, "liked_by_me": likedByMe, "reply_count": replyCount,
 		})
 	}
 	if comments == nil {
@@ -783,6 +1531,37 @@ func (h *CommunityHandler) DeletePost(c *gin.Context) {
 	c.JSON(200, gin.H{"ok": true})
 }
 
+func (h *CommunityHandler) EditPost(c *gin.Context) {
+	callerID := c.GetInt64("user_id")
+	postID, _ := strconv.ParseInt(c.Param("post_id"), 10, 64)
+	var commID, authorID int64
+	h.DB.QueryRow(`SELECT community_id, user_id, created_at FROM community_posts WHERE id=$1`, postID).Scan(&commID, &authorID)
+	if callerID != authorID && !canModerate(h.getMemberRole(commID, callerID)) {
+		c.JSON(403, gin.H{"error": "only the post's author or a moderator can edit it"})
+		return
+	}
+	// 1-hour edit window
+	var createdAt time.Time
+	h.DB.QueryRow(`SELECT created_at FROM community_posts WHERE id=$1`, postID).Scan(&createdAt)
+	if time.Since(createdAt) > time.Hour {
+		c.JSON(403, gin.H{"error": "edit window expired (1 hour)"})
+		return
+	}
+	var req struct {
+		Title string `json:"title"`
+		Body  string `json:"body"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Title) == "" {
+		c.JSON(400, gin.H{"error": "title is required"})
+		return
+	}
+	h.DB.Exec(`UPDATE community_posts SET title=$1, body=$2 WHERE id=$3`, strings.TrimSpace(req.Title), strings.TrimSpace(req.Body), postID)
+	// Clear old mentions and save new ones
+	h.DB.Exec(`DELETE FROM community_post_mentions WHERE post_id=$1`, postID)
+	h.saveMentions(postID, req.Body)
+	c.JSON(200, gin.H{"ok": true})
+}
+
 // getMemberRole returns the caller's role in a community ("" if not a member).
 func (h *CommunityHandler) getMemberRole(commID, userID int64) string {
 	var role string
@@ -799,9 +1578,11 @@ func (h *CommunityHandler) GetMembers(c *gin.Context) {
 	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
 	rows, err := h.DB.Query(`
 		SELECT u.id, u.username, COALESCE(u.profile_photo,''), cm.role, cm.status,
-		       COALESCE(u.reputation,0), cm.joined_at, COALESCE(cm.custom_title,'')
+		       COALESCE(u.reputation,0), cm.joined_at, COALESCE(cm.custom_title,''),
+		       COALESCE(cts.allow_tagging,true)
 		FROM community_members cm
 		JOIN users u ON u.id = cm.user_id
+		LEFT JOIN community_tag_settings cts ON cts.community_id = cm.community_id AND cts.user_id = cm.user_id
 		WHERE cm.community_id=$1 AND cm.status IN ('active','muted')
 		ORDER BY CASE cm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 WHEN 'moderator' THEN 2 ELSE 3 END, cm.joined_at ASC`, commID)
 	if err != nil {
@@ -813,7 +1594,8 @@ func (h *CommunityHandler) GetMembers(c *gin.Context) {
 	for rows.Next() {
 		var uid, rep int64
 		var uname, photo, role, status, joinedAt, customTitle string
-		if rows.Scan(&uid, &uname, &photo, &role, &status, &rep, &joinedAt, &customTitle) != nil {
+		var taggingAllowed bool
+		if rows.Scan(&uid, &uname, &photo, &role, &status, &rep, &joinedAt, &customTitle, &taggingAllowed) != nil {
 			continue
 		}
 		members = append(members, gin.H{
@@ -823,6 +1605,7 @@ func (h *CommunityHandler) GetMembers(c *gin.Context) {
 			"custom_title":  customTitle,
 			"title":         repTitle(rep, customTitle),
 			"verified":      rep >= verifiedRepThreshold,
+			"tagging_allowed": taggingAllowed,
 		})
 	}
 	if members == nil {
@@ -886,6 +1669,52 @@ func (h *CommunityHandler) AssignRole(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{"ok": true})
+}
+
+// AddMember lets an admin (or members if members_can_add is true) add a user
+// directly to the community, bypassing join requests.
+func (h *CommunityHandler) AddMember(c *gin.Context) {
+	callerID := c.GetInt64("user_id")
+	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+
+	var req struct {
+		UserID int64 `json:"user_id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+
+	callerRole := h.getMemberRole(commID, req.UserID)
+	if callerRole != "" {
+		c.JSON(200, gin.H{"ok": true, "status": "already_member"})
+		return
+	}
+
+	var membersCanAdd bool
+	h.DB.QueryRow(`SELECT COALESCE(members_can_add,true) FROM communities WHERE id=$1`, commID).Scan(&membersCanAdd)
+
+	allowed := false
+	if callerRole == "owner" || callerRole == "admin" {
+		allowed = true
+	} else if membersCanAdd && h.getMemberRole(commID, callerID) == "member" {
+		allowed = true
+	}
+	if !allowed {
+		c.JSON(403, gin.H{"error": "you don't have permission to add members"})
+		return
+	}
+
+	h.DB.Exec(`INSERT INTO community_members(community_id,user_id) VALUES($1,$2)
+		ON CONFLICT(community_id,user_id) DO UPDATE SET status='active'`, commID, req.UserID)
+	h.DB.Exec(`UPDATE communities SET member_count=member_count+1 WHERE id=$1`, commID)
+
+	if h.Hub != nil {
+		h.Hub.Broadcast(map[string]interface{}{
+			"type": "community_join", "community_id": commID, "user_id": req.UserID, "joined": true,
+		})
+	}
+	c.JSON(200, gin.H{"ok": true, "status": "joined"})
 }
 
 // ── Ban / Mute member ────────────────────────────────────────────────────────
@@ -1038,6 +1867,9 @@ func (h *CommunityHandler) UpdateSettings(c *gin.Context) {
 		// Auto-mod rules. nil = unchanged; words is a comma-separated list.
 		AutomodBlockLinks *bool   `json:"automod_block_links"`
 		AutomodWords      *string `json:"automod_words"`
+
+		// Whether regular (non-admin) members may add other members.
+		MembersCanAdd *bool `json:"members_can_add"`
 	}
 	c.ShouldBindJSON(&req)
 	var tagsArray string
@@ -1065,6 +1897,14 @@ func (h *CommunityHandler) UpdateSettings(c *gin.Context) {
 		automodWords = *req.AutomodWords
 		automodWordsSet = true
 	}
+	membersCanAdd := -1 // -1 unchanged, 1 on, 0 off
+	if req.MembersCanAdd != nil {
+		if *req.MembersCanAdd {
+			membersCanAdd = 1
+		} else {
+			membersCanAdd = 0
+		}
+	}
 
 	// Every text field merges instead of overwriting: partial payloads (e.g.
 	// the photo-change call that only sends icon/cover_photo, or a slow-mode
@@ -1081,11 +1921,12 @@ func (h *CommunityHandler) UpdateSettings(c *gin.Context) {
 		slowmode_seconds=CASE WHEN $8>=0 THEN $8 ELSE slowmode_seconds END,
 		tags=CASE WHEN $9<>'' THEN $9::text[] ELSE tags END,
 		automod_block_links=CASE WHEN $10>=0 THEN $10=1 ELSE automod_block_links END,
-		automod_words=CASE WHEN $12 THEN $11 ELSE automod_words END
+		automod_words=CASE WHEN $12 THEN $11 ELSE automod_words END,
+		members_can_add=CASE WHEN $14>=0 THEN $14=1 ELSE members_can_add END
 		WHERE id=$13`,
 		req.Name, req.Description, req.Rules, req.Category, req.Visibility,
 		req.Icon, req.CoverPhoto, slowmode, tagsArray, blockLinks, automodWords,
-		automodWordsSet, commID)
+		automodWordsSet, commID, membersCanAdd)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -1178,6 +2019,23 @@ func (h *CommunityHandler) GetMessages(c *gin.Context) {
 		messages = []gin.H{}
 	}
 	c.JSON(200, gin.H{"messages": messages})
+}
+
+// POST /community/:id/read — mark up to the latest message as read for this
+// member (clears the unread badge on the chat list).
+func (h *CommunityHandler) MarkRead(c *gin.Context) {
+	callerID := c.GetInt64("user_id")
+	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	var maxID int64
+	h.DB.QueryRow(`SELECT MAX(id) FROM community_messages WHERE community_id=$1`, commID).Scan(&maxID)
+	if maxID == 0 {
+		c.JSON(200, gin.H{"ok": true})
+		return
+	}
+	h.DB.Exec(`
+		UPDATE community_members SET last_read_message_id = GREATEST(last_read_message_id, $1)
+		WHERE community_id=$2 AND user_id=$3 AND status='active'`, maxID, commID, callerID)
+	c.JSON(200, gin.H{"ok": true})
 }
 
 // SendMessage posts a text and/or media message to the community's chat.
@@ -1742,6 +2600,11 @@ func (h *CommunityHandler) DeleteListing(c *gin.Context) {
 	if _, err := h.DB.Exec(`DELETE FROM community_listings WHERE id=$1`, listingID); err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
+	}
+	if h.Hub != nil {
+		h.Hub.Broadcast(map[string]interface{}{
+			"type": "listing_deleted", "listing_id": listingID, "community_id": commID,
+		})
 	}
 	c.JSON(200, gin.H{"ok": true})
 }

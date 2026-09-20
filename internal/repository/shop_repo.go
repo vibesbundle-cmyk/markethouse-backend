@@ -100,6 +100,67 @@ func (r *ShopRepo) EnsureProductForListing(listingID int64) (*models.Product, er
 	return r.GetProductByID(newPID)
 }
 
+// EnsureProductForSdListing bridges a Supply & Demand "supply" listing onto
+// the legacy products table that cart/checkout/orders key off (same pattern
+// as EnsureProductForListing). The link is kept in supply_demand_listings
+// .product_id so later calls reuse the same mirror product.
+func (r *ShopRepo) EnsureProductForSdListing(listingID int64) (*models.Product, error) {
+	var (
+		pid     sql.NullInt64
+		userID  int64
+		title   sql.NullString
+		desc    sql.NullString
+		cat     sql.NullString
+		price   float64
+		images  pq.StringArray
+	)
+	err := r.DB.QueryRow(`
+		SELECT product_id, user_id, title, description, category, COALESCE(price,0), images
+		FROM supply_demand_listings WHERE id=$1 AND kind='supply' AND status='active'`, listingID).
+		Scan(&pid, &userID, &title, &desc, &cat, &price, &images)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("supply listing #%d is not available for purchase", listingID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("supply listing #%d not found", listingID)
+	}
+	if pid.Valid {
+		if p, perr := r.GetProductByID(pid.Int64); perr == nil {
+			return p, nil
+		}
+	}
+	var newPID int64
+	if err := r.DB.QueryRow(`
+		INSERT INTO products
+		  (user_id, name, description, category, price, stock_count, is_unlimited_stock, images, is_active)
+		VALUES ($1,$2,$3,$4,$5,1,true,$6,true)
+		RETURNING id`,
+		userID, title.Value, desc.Value, cat.Value, price, images,
+	).Scan(&newPID); err != nil {
+		return nil, err
+	}
+	r.DB.Exec(`UPDATE supply_demand_listings SET product_id=$1 WHERE id=$2`, newPID, listingID)
+	return r.GetProductByID(newPID)
+}
+
+// FindSdSupplyByProductID looks up a Supply & Demand "supply" listing that a
+// given shop product id mirrors (product_id bridge). It's used after payment
+// to notify the supplier only once the buyer has actually paid. Returns
+// found=false when the product didn't originate from a supply listing.
+func (r *ShopRepo) FindSdSupplyByProductID(productID int64) (sdID, sellerID int64, title string, found bool, err error) {
+	err = r.DB.QueryRow(`
+		SELECT id, user_id, title FROM supply_demand_listings
+		WHERE product_id=$1 AND kind='supply' AND status != 'removed'`, productID).
+		Scan(&sdID, &sellerID, &title)
+	if err == sql.ErrNoRows {
+		return 0, 0, "", false, nil
+	}
+	if err != nil {
+		return 0, 0, "", false, err
+	}
+	return sdID, sellerID, title, true, nil
+}
+
 func (r *ShopRepo) GetProductsByVendor(vendorID int64) ([]models.Product, error) {
 	rows, err := r.DB.Query(`
 		SELECT id, user_id, name, description, category, price,
@@ -156,20 +217,23 @@ func scanProducts(rows *sql.Rows) ([]models.Product, error) {
 
 // ── CART ─────────────────────────────────────────────────────────────────────
 
-func (r *ShopRepo) AddToCart(userID, productID int64, qty int) error {
+func (r *ShopRepo) AddToCart(userID, productID int64, qty int, origin string) error {
+	if origin == "" {
+		origin = "commerce"
+	}
 	_, err := r.DB.Exec(`
-		INSERT INTO cart_items (user_id, product_id, quantity)
-		VALUES ($1,$2,$3)
+		INSERT INTO cart_items (user_id, product_id, quantity, origin)
+		VALUES ($1,$2,$3,$4)
 		ON CONFLICT (user_id, product_id)
-		DO UPDATE SET quantity = cart_items.quantity + EXCLUDED.quantity`,
-		userID, productID, qty)
+		DO UPDATE SET quantity = cart_items.quantity + EXCLUDED.quantity, origin = EXCLUDED.origin`,
+		userID, productID, qty, origin)
 	return err
 }
 
 func (r *ShopRepo) GetCart(userID int64) ([]models.CartItem, error) {
 	rows, err := r.DB.Query(`
 		SELECT ci.id, ci.user_id, ci.product_id, ci.quantity, ci.created_at,
-		       p.name, p.price, p.user_id, COALESCE(p.images,'{}')
+		       p.name, p.price, p.user_id, COALESCE(p.images,'{}'), COALESCE(ci.origin,'commerce')
 		FROM cart_items ci
 		JOIN products p ON p.id = ci.product_id
 		WHERE ci.user_id=$1`, userID)
@@ -183,7 +247,7 @@ func (r *ShopRepo) GetCart(userID int64) ([]models.CartItem, error) {
 		if err := rows.Scan(
 			&it.ID, &it.UserID, &it.ProductID, &it.Quantity, &it.CreatedAt,
 			&it.ProductName, &it.ProductPrice, &it.VendorID,
-			pq.Array(&it.Images),
+			pq.Array(&it.Images), &it.Origin,
 		); err != nil {
 			return nil, err
 		}

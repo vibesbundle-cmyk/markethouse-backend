@@ -125,8 +125,31 @@ func (s *MessageService) StarMessage(msgID int64, star bool) error {
 func (s *MessageService) PinMessage(msgID int64, pin bool) error {
 	return s.Repo.PinMessage(msgID, pin)
 }
-func (s *MessageService) ReactMessage(msgID int64, reaction string) error {
-	return s.Repo.ReactMessage(msgID, reaction)
+func (s *MessageService) ReactMessage(userID, msgID int64, emoji string) ([]map[string]interface{}, error) {
+	mine, err := s.Repo.ReactMessage(userID, msgID, emoji)
+	if err != nil {
+		return nil, err
+	}
+	// Push the fresh chips to the other participant in real time (computed
+	// from *their* point of view so "mine" highlights light up on their side).
+	cid, u1, u2, err := s.Repo.GetMessageConversationID(msgID)
+	if err == nil && s.Hub != nil {
+		otherID := u1
+		if otherID == userID {
+			otherID = u2
+		}
+		if otherID != userID {
+			theirs := s.Repo.ReactionsSummary([]int64{msgID}, otherID)[msgID]
+			s.Hub.SendToUser(otherID, map[string]interface{}{
+				"type":            "message_reactions",
+				"conversation_id": cid,
+				"message_id":      msgID,
+				"react_by":        userID,
+				"reactions":       theirs,
+			})
+		}
+	}
+	return mine, nil
 }
 func (s *MessageService) EditMessage(userID, msgID int64, content string) error {
 	return s.Repo.EditMessage(userID, msgID, content)
@@ -165,6 +188,14 @@ func (s *MessageService) GetStarredMessages(userID int64) ([]map[string]interfac
 func (s *MessageService) SearchMessages(userID int64, query string) ([]map[string]interface{}, error) {
 	return s.Repo.SearchMessages(userID, query)
 }
-func (s *MessageService) UpdateConversationSettings(convID int64, settings map[string]interface{}) error {
-	return s.Repo.UpdateConversationSettings(convID, settings)
+func (s *MessageService) UpdateConversationSettings(convID, userID int64, settings map[string]interface{}) error {
+	return s.Repo.UpdateConversationSettings(convID, userID, settings)
+}
+
+func (s *MessageService) LogCall(senderID, receiverID int64, callType string, duration int, endedBy string) error {
+	return s.Repo.LogCall(senderID, receiverID, callType, duration, endedBy)
+}
+
+func (s *MessageService) GetCallLogs(userID int64) ([]map[string]interface{}, error) {
+	return s.Repo.GetCallLogs(userID)
 }

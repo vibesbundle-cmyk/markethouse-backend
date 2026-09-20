@@ -80,8 +80,9 @@ func (h *WSHandler) HandleWS(c *gin.Context) {
 				"lat":       msg.Lat,
 				"lng":       msg.Lng,
 			})
-		case "call_offer", "call_answer", "call_reject", "call_end":
-			// Relay call signaling to the other party.
+		case "call_offer", "call_answer", "call_reject", "call_end", "call_ice":
+			// Relay call signaling to the other party. The SDP offer/answer
+			// and ICE candidates ride along as extra JSON fields forward.
 			payload := map[string]interface{}{
 				"type":      msg.Type,
 				"sender_id": userID,
@@ -89,8 +90,37 @@ func (h *WSHandler) HandleWS(c *gin.Context) {
 			// Copy extra fields from the raw JSON
 			var extra map[string]interface{}
 			json.Unmarshal(raw, &extra)
-			if v, ok := extra["is_video"]; ok {
-				payload["is_video"] = v
+			for _, k := range []string{"is_video", "sdp", "ice_candidate", "candidate"} {
+				if v, ok := extra[k]; ok {
+					payload[k] = v
+				}
+			}
+			// DEBUG: trace call signaling delivery
+			if h.Hub != nil {
+				online := h.Hub.IsOnline(msg.ReceiverID)
+				sdpLen := 0
+				if s, ok := payload["sdp"].(map[string]interface{}); ok {
+					if str, ok2 := s["sdp"].(string); ok2 {
+						sdpLen = len(str)
+					}
+				}
+				println("[WS] call type=", msg.Type, " from=", userID,
+					" to=", msg.ReceiverID, " recvOnline=", online)
+				if msg.Type == "call_offer" || msg.Type == "call_answer" {
+					println("[WS] ", msg.Type, " sdpLen=", sdpLen)
+				}
+			}
+			// Include caller identity on call_offer so the receiver's incoming-
+			// call UI can show their name + photo without doing a follow-up
+			// lookup (avoids the "Unknown" placeholder when the caller isn't
+			// already in the receiver's conversation list).
+			if msg.Type == "call_offer" && h.DB != nil {
+				var fullName, username, photo string
+				h.DB.QueryRow(`SELECT COALESCE(full_name,''), COALESCE(username,''), COALESCE(profile_photo,'')
+					FROM users WHERE id=$1`, userID).Scan(&fullName, &username, &photo)
+				payload["sender_full_name"] = fullName
+				payload["sender_username"]  = username
+				payload["sender_photo"]     = photo
 			}
 			h.Hub.SendToUser(msg.ReceiverID, payload)
 			// For call_offer, also send a push notification so the
@@ -113,6 +143,7 @@ func (h *WSHandler) HandleWS(c *gin.Context) {
 					callerName+" is calling you", map[string]string{
 						"type":      "call_offer",
 						"sender_id": strconv.FormatInt(userID, 10),
+						"is_video":  strconv.FormatBool(isVideo),
 					})
 			}
 		}

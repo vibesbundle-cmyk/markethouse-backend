@@ -27,24 +27,17 @@ type PostService struct {
 	Storage  storage.Storage
 }
 
-func (s *PostService) CreatePost(userID int64, caption, postType, category string, price float64, isLocked bool, taggedUsers, location, audience, audienceUserIDs string, lat, lng *float64, files []*multipart.FileHeader) (models.Post, error) {
+func (s *PostService) CreatePost(userID int64, caption, postType, category string, price float64, isLocked bool, taggedUsers, location, audience, audienceUserIDs string, lat, lng *float64, files []*multipart.FileHeader, mediaURL, mediaType string) (models.Post, error) {
 	if len(caption) > 2000 {
 		return models.Post{}, errors.New("caption too long (max 2000 chars)")
 	}
-	if len(files) == 0 {
+	if len(files) == 0 && mediaURL == "" {
 		return models.Post{}, errors.New("at least one file is required")
 	}
+	if mediaURL != "" && len(files) > 0 {
+		return models.Post{}, errors.New("provide either a file or media_url, not both")
+	}
 
-	user, err := s.AuthRepo.GetFullUserByID(userID)
-	if err != nil {
-		return models.Post{}, errors.New("user not found")
-	}
-	if postType == "product" && user.AccountType != "business" {
-		return models.Post{}, errors.New("only business accounts can post products")
-	}
-	if isLocked && user.AccountType != "creator" {
-		return models.Post{}, errors.New("only creators can lock content")
-	}
 	if price < 0 {
 		return models.Post{}, errors.New("price cannot be negative")
 	}
@@ -55,6 +48,23 @@ func (s *PostService) CreatePost(userID int64, caption, postType, category strin
 	}
 
 	media := make([]models.PostMediaItem, 0, len(files))
+	if mediaURL != "" {
+		// Reshare-as-post: reuse existing media instead of a fresh upload.
+		if mediaType == "" {
+			if strings.HasSuffix(strings.ToLower(mediaURL), ".mp4") ||
+				strings.HasSuffix(strings.ToLower(mediaURL), ".mov") ||
+				strings.HasSuffix(strings.ToLower(mediaURL), ".webm") ||
+				strings.HasSuffix(strings.ToLower(mediaURL), ".m4v") {
+				mediaType = "video"
+			} else {
+				mediaType = "image"
+			}
+		}
+		if mediaType != "image" && mediaType != "video" {
+			return models.Post{}, errors.New("media_type must be image or video")
+		}
+		media = append(media, models.PostMediaItem{URL: mediaURL, Type: mediaType})
+	}
 	for _, file := range files {
 		url, mediaType, err := s.uploadPostFile(file)
 		if err != nil {
@@ -87,7 +97,7 @@ func (s *PostService) CreatePost(userID int64, caption, postType, category strin
 		AudienceIDs: audienceUserIDs,
 	}
 
-	if err = s.Repo.CreatePost(&post, media); err != nil {
+	if err := s.Repo.CreatePost(&post, media); err != nil {
 		return models.Post{}, err
 	}
 	return post, nil
