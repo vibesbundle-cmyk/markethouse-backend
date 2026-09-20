@@ -275,7 +275,6 @@ func SetupRouter(
 	// ---- Admin (fee config — checkout/escrow/wallet integration is pending, see handler notes) ----
 	auth.GET("/admin/settings", supplyDemandHandler.GetSettings)
 	auth.PUT("/admin/settings", supplyDemandHandler.UpdateSettings)
-	auth.POST("/community", communityHandler.Create)
 	// Routes with explicit path segments (most specific) come before wildcard routes
 	auth.POST("/community/:id/join", communityHandler.Join)
 	auth.DELETE("/community/:id/leave", communityHandler.Leave)
