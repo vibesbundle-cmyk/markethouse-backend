@@ -458,6 +458,10 @@ func runSelfHealingMigrations(db *sql.DB) error {
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION`,
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS lga      TEXT DEFAULT ''`,
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS state    TEXT DEFAULT ''`,
+		// auth_repo.go SELECTs COALESCE(location_text,'') but no migration ever
+		// added it — fresh DBs (like the new Render one) 500 on every login
+		// lookup. This column already exists on long-lived local DBs.
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS location_text TEXT DEFAULT ''`,
 
 		// Post signals table (permanent store of every user-interaction event)
 		`CREATE TABLE IF NOT EXISTS post_signals (
