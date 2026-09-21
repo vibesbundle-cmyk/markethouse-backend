@@ -318,6 +318,19 @@ func (h *AuthHandler) SetHideStatusCredit(c *gin.Context) {
 	c.JSON(200, gin.H{"ok": true})
 }
 
+// DeleteAccount permanently removes the signed-in user's account and every
+// record tied to it (posts, chats, orders, wallet transactions, follows,
+// followers, commerce listings, statuses and communities — all wiped in one
+// transaction). The client is expected to clear local tokens afterwards.
+func (h *AuthHandler) DeleteAccount(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	if err := h.Service.DeleteAccount(userID); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"message": "account deleted"})
+}
+
 func (h *AuthHandler) VerifyPhone(c *gin.Context) {
 
 	var req struct {

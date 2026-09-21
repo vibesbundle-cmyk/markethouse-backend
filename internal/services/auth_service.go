@@ -530,6 +530,11 @@ func (s *AuthService) UsernameExists(username string) bool {
 	return s.Repo.UsernameExists(username)
 }
 
+// ---------------- DELETE ACCOUNT ----------------
+func (s *AuthService) DeleteAccount(userID int64) error {
+	return s.Repo.DeleteUser(userID)
+}
+
 // ---------------- STATUS RESHARE CREDIT ----------------
 func (s *AuthService) SetHideStatusCredit(userID int64, hide bool) error {
 	return s.Repo.SetHideStatusCredit(userID, hide)

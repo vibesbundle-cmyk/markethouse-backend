@@ -287,6 +287,32 @@ func (r *AuthRepo) MarkPhoneVerified(mobile string) error {
 	return err
 }
 
+// DeleteUser permanently removes the account and everything tied to it. Most
+// tables cascade off users(id); the handful that don't are wiped here inside
+// one transaction so a partial delete can never happen.
+func (r *AuthRepo) DeleteUser(userID int64) error {
+	tx, err := r.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// orders + wallet_transactions reference users without ON DELETE CASCADE.
+	if _, err = tx.Exec(`DELETE FROM orders WHERE buyer_id=$1 OR seller_id=$1`, userID); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`DELETE FROM wallet_transactions WHERE user_id=$1 OR counterparty_id=$1`, userID); err != nil {
+		return err
+	}
+
+	// Blocks, follows, posts, chats, commerce, statuses, communities,
+	// notifications, etc. all cascade off this row.
+	if _, err = tx.Exec(`DELETE FROM users WHERE id=$1`, userID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (r *AuthRepo) GetUserByID(id int64) (models.User, error) {
 	var user models.User
 	var username sql.NullString

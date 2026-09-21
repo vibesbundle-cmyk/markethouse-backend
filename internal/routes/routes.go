@@ -109,6 +109,7 @@ func SetupRouter(
 	auth.GET("/user/hide-status-credit", authHandler.GetHideStatusCredit)
 	auth.PUT("/user/hide-status-credit", authHandler.SetHideStatusCredit)
 	auth.GET("/profile", authHandler.Profile)
+	auth.DELETE("/user/account", authHandler.DeleteAccount)
 	auth.GET("/user/:username", authHandler.GetPublicProfile)
 
 	// ── FOLLOW ────────────────────────────────────────────────────
