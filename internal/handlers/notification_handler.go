@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"database/sql"
+	"log"
 	"strconv"
 	"time"
 
@@ -204,8 +205,15 @@ func (h *NotificationHandler) RegisterDevice(c *gin.Context) {
 	if req.Platform == "" {
 		req.Platform = "android"
 	}
-	h.DB.Exec(`INSERT INTO device_tokens(user_id, token, platform) VALUES($1,$2,$3)
+	res, err := h.DB.Exec(`INSERT INTO device_tokens(user_id, token, platform) VALUES($1,$2,$3)
 		ON CONFLICT (user_id, token) DO UPDATE SET platform=EXCLUDED.platform, updated_at=NOW()`,
 		userID, req.Token, req.Platform)
+	if err != nil {
+		log.Printf("device register: user=%d err=%v", userID, err)
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	n, _ := res.RowsAffected()
+	log.Printf("device register: user=%d platform=%s affected=%d token_len=%d", userID, req.Platform, n, len(req.Token))
 	c.JSON(200, gin.H{"ok": true})
 }

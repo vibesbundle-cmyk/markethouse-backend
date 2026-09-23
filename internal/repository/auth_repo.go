@@ -262,6 +262,21 @@ func (r *AuthRepo) SetHideStatusCredit(userID int64, hide bool) error {
 	return err
 }
 
+// Likes visibility: whether the user's liked (loved) posts are shown publicly
+// on their profile. Mirrors hide_status_credit (default on/public).
+func (r *AuthRepo) SetShowLikes(userID int64, show bool) error {
+	_, err := r.DB.Exec(`UPDATE users SET show_likes=$1 WHERE id=$2`, show, userID)
+	return err
+}
+
+func (r *AuthRepo) ShowLikes(userID int64) (bool, error) {
+	var show bool
+	err := r.DB.QueryRow(`SELECT COALESCE(show_likes,true) FROM users WHERE id=$1`, userID).Scan(&show)
+	return show, err
+}
+
+// Likes privacy default is on/public — the toggle only removes things from
+// the profile, it doesn't add new public surface.
 func (r *AuthRepo) HideStatusCredit(userID int64) (bool, error) {
 	var hide bool
 	err := r.DB.QueryRow(`SELECT COALESCE(hide_status_credit,false) FROM users WHERE id=$1`, userID).Scan(&hide)
@@ -298,7 +313,11 @@ func (r *AuthRepo) DeleteUser(userID int64) error {
 	defer tx.Rollback()
 
 	// orders + wallet_transactions reference users without ON DELETE CASCADE.
-	if _, err = tx.Exec(`DELETE FROM orders WHERE buyer_id=$1 OR seller_id=$1`, userID); err != nil {
+	if _, err = tx.Exec(`
+		DELETE FROM orders
+		WHERE buyer_id=$1
+		   OR COALESCE(seller_id,0)=$1
+		   OR COALESCE(vendor_id,0)=$1`, userID); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(`DELETE FROM wallet_transactions WHERE user_id=$1 OR counterparty_id=$1`, userID); err != nil {

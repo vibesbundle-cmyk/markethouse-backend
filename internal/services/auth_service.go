@@ -535,6 +535,15 @@ func (s *AuthService) DeleteAccount(userID int64) error {
 	return s.Repo.DeleteUser(userID)
 }
 
+// ---------------- LIKES PRIVACY ----------------
+func (s *AuthService) SetShowLikes(userID int64, show bool) error {
+	return s.Repo.SetShowLikes(userID, show)
+}
+
+func (s *AuthService) ShowLikes(userID int64) (bool, error) {
+	return s.Repo.ShowLikes(userID)
+}
+
 // ---------------- STATUS RESHARE CREDIT ----------------
 func (s *AuthService) SetHideStatusCredit(userID int64, hide bool) error {
 	return s.Repo.SetHideStatusCredit(userID, hide)

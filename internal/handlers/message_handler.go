@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"log"
 	"markethouse/internal/models"
 	"markethouse/internal/services"
 	"strconv"
@@ -66,7 +67,66 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
+	// OS push for DMs. WS only reaches sockets that are still open — a
+	// backgrounded/killed app never shows a tray banner from new_message alone.
+	if h.Service.Repo == nil || h.Service.Repo.DB == nil {
+		log.Println("dm push: skipped (no db)")
+	} else {
+		db := h.Service.Repo.DB
+		if !notifyAllowed(db, req.ReceiverID, "message") {
+			log.Printf("dm push: skipped (prefs off) user=%d", req.ReceiverID)
+		} else {
+			var muted bool
+			db.QueryRow(`SELECT COALESCE(is_muted,false) FROM conversations WHERE id=$1`,
+				result.ConversationID).Scan(&muted)
+			if muted {
+				log.Printf("dm push: skipped (muted) conv=%d", result.ConversationID)
+			} else {
+				title := userName(db, senderID)
+				body := pushPreview(req.MessageType, req.Content)
+				data := map[string]string{
+					"type":            "message",
+					"entity_type":     "message",
+					"entity_id":       strconv.FormatInt(result.ConversationID, 10),
+					"conversation_id": strconv.FormatInt(result.ConversationID, 10),
+					"sender_id":       strconv.FormatInt(senderID, 10),
+				}
+				log.Printf("dm push: sending to user=%d conv=%d title=%q", req.ReceiverID, result.ConversationID, title)
+				go services.SendPush(db, req.ReceiverID, title, body, data)
+			}
+		}
+	}
 	c.JSON(200, gin.H{"conversation_id": result.ConversationID, "message": result})
+}
+
+// pushPreview is the tray body for a DM: text (or caption) truncated, with
+// friendly labels for media types that have no caption.
+func pushPreview(msgType, content string) string {
+	content = strings.TrimSpace(content)
+	if content == "" || (len(content) > 0 && content[0] == '{') {
+		switch msgType {
+		case "image":
+			return "Sent a photo"
+		case "video":
+			return "Sent a video"
+		case "audio", "voice":
+			return "Sent a voice message"
+		case "file":
+			return "Sent a file"
+		case "location":
+			return "Sent a location"
+		case "transfer":
+			return "Sent a money transfer"
+		default:
+			return "Sent a message"
+		}
+	}
+	const max = 120
+	runes := []rune(content)
+	if len(runes) > max {
+		return string(runes[:max]) + "…"
+	}
+	return content
 }
 
 func (h *MessageHandler) GetHistory(c *gin.Context) {

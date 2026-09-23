@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -122,7 +123,12 @@ func getFCMAccessToken(sa *serviceAccount) (string, error) {
 
 func SendPush(db *sql.DB, userID int64, title, body string, data map[string]string) {
 	sa := loadServiceAccount()
-	if sa == nil || db == nil {
+	if sa == nil {
+		log.Printf("fcm: aborted user=%d (no service account loaded)", userID)
+		return
+	}
+	if db == nil {
+		log.Printf("fcm: aborted user=%d (nil db)", userID)
 		return
 	}
 
@@ -134,11 +140,13 @@ func SendPush(db *sql.DB, userID int64, title, body string, data map[string]stri
 
 	rows, err := db.Query(`SELECT token FROM device_tokens WHERE user_id=$1`, userID)
 	if err != nil {
+		log.Println("fcm: device_tokens query:", err)
 		return
 	}
 	defer rows.Close()
 
 	client := &http.Client{Timeout: 10 * time.Second}
+	sent := 0
 	for rows.Next() {
 		var deviceToken string
 		if rows.Scan(&deviceToken) != nil || deviceToken == "" {
@@ -173,10 +181,22 @@ func SendPush(db *sql.DB, userID int64, title, body string, data map[string]stri
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+token)
 
-		if resp, e := client.Do(req); e == nil {
-			resp.Body.Close()
-		} else {
+		resp, e := client.Do(req)
+		if e != nil {
 			log.Println("fcm send error:", e)
+			continue
 		}
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			log.Printf("fcm send HTTP %d user=%d: %s", resp.StatusCode, userID, string(respBody))
+			continue
+		}
+		sent++
 	}
+	if sent == 0 {
+		log.Printf("fcm: no tokens delivered for user %d (title=%q)", userID, title)
+		return
+	}
+	log.Printf("fcm: sent %d device(s) user=%d title=%q", sent, userID, title)
 }

@@ -52,3 +52,8 @@ services:
         sync: false
       - key: FLW_SECRET_KEY
         sync: false
+      # FCM push: paste the whole service-account JSON from
+      # Firebase Console -> Project settings -> Service accounts
+      # (same Firebase project as the app's google-services.json).
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false

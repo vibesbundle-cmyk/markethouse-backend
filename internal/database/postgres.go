@@ -395,10 +395,10 @@ func runSelfHealingMigrations(db *sql.DB) error {
 		// user can hide their name on other people's reshares of their
 		// statuses — feed then serves the origin as anonymous (default on)
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS hide_status_credit BOOLEAN NOT NULL DEFAULT false`,
-		// status music: optional song attached via the media editor. The song
-		// is baked into the media as audio — these fields just power the
-		// "♬ title" label shown next to the status time (never stamped on the
-		// media itself).
+		// likes privacy: when false the user's liked (loved) posts are NOT
+		// shown to other people on their public profile. Defaults to true
+		// (public) to match the behaviour everyone had before the toggle.
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS show_likes BOOLEAN NOT NULL DEFAULT true`,
 		`ALTER TABLE statuses ADD COLUMN IF NOT EXISTS music_title TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE statuses ADD COLUMN IF NOT EXISTS music_url  TEXT NOT NULL DEFAULT ''`,
 
@@ -1005,6 +1005,10 @@ func runNewFeatureMigrations(db *sql.DB) error {
 		`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_reference TEXT`,
 		`CREATE INDEX IF NOT EXISTS idx_orders_payment_ref ON orders(payment_reference)`,
 		`ALTER TABLE wallet_transactions ALTER COLUMN user_id DROP NOT NULL`,
+		// Orders: add seller_id (synonym for vendor_id in shop flow) to satisfy
+		// legacy cleanup queries that reference seller_id.
+		`ALTER TABLE orders ADD COLUMN IF NOT EXISTS seller_id INTEGER REFERENCES users(id) ON DELETE CASCADE`,
+		`UPDATE orders SET seller_id = vendor_id WHERE seller_id IS NULL AND vendor_id IS NOT NULL`,
 		// Commerce listings mirror into the legacy products table for the
 		// cart/checkout flow — this link column records the mirror row.
 		`ALTER TABLE commerce_listings ADD COLUMN IF NOT EXISTS product_id BIGINT`,
