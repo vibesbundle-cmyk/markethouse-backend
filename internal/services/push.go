@@ -3,9 +3,12 @@ package services
 import (
 	"bytes"
 	"context"
+	"crypto/rsa"
+	"crypto/x509"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
@@ -68,6 +71,34 @@ func loadServiceAccount() *serviceAccount {
 	return fcmSA
 }
 
+// parseRSAPrivateKey turns the service-account PEM (`private_key` field)
+// into *rsa.PrivateKey. Google issues PKCS#8 ("BEGIN PRIVATE KEY"); some
+// tools re-emit PKCS#1 ("BEGIN RSA PRIVATE KEY"). SignedString rejects a
+// raw PEM string with "RSA sign expects *rsa.PrivateKey".
+func parseRSAPrivateKey(pemStr string) (*rsa.PrivateKey, error) {
+	pemStr = strings.TrimSpace(pemStr)
+	// Env JSON sometimes keeps literal \n unexpanded when pasted wrong.
+	if !strings.Contains(pemStr, "\n") {
+		pemStr = strings.ReplaceAll(pemStr, `\n`, "\n")
+	}
+	block, _ := pem.Decode([]byte(pemStr))
+	if block == nil {
+		return nil, fmt.Errorf("no PEM block in private_key")
+	}
+	if key, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
+		return key, nil
+	}
+	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse private key: %w", err)
+	}
+	key, ok := parsed.(*rsa.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("private_key is not RSA (got %T)", parsed)
+	}
+	return key, nil
+}
+
 func getFCMAccessToken(sa *serviceAccount) (string, error) {
 	fcmCacheMu.Lock()
 	defer fcmCacheMu.Unlock()
@@ -87,9 +118,11 @@ func getFCMAccessToken(sa *serviceAccount) (string, error) {
 
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 
-	pemKey := sa.PrivateKey
-	pemKey = strings.TrimSpace(pemKey)
-	signed, err := token.SignedString(pemKey)
+	key, err := parseRSAPrivateKey(sa.PrivateKey)
+	if err != nil {
+		return "", fmt.Errorf("sign JWT: %w", err)
+	}
+	signed, err := token.SignedString(key)
 	if err != nil {
 		return "", fmt.Errorf("sign JWT: %w", err)
 	}
