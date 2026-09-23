@@ -57,9 +57,9 @@ func (s *ShopService) GetMyProducts(vendorID int64) ([]models.Product, error) {
 
 // ── CART ─────────────────────────────────────────────────────────────────────
 
-func (s *ShopService) AddToCart(userID, id int64, qty int) error {
+func (s *ShopService) AddToCart(userID, id int64, qty int) (*models.Product, error) {
 	if qty <= 0 {
-		return errors.New("quantity must be at least 1")
+		return nil, errors.New("quantity must be at least 1")
 	}
 	// Try as a commerce_listings.id first — EnsureProductForListing will
 	// create/find the mirror product row.
@@ -68,33 +68,39 @@ func (s *ShopService) AddToCart(userID, id int64, qty int) error {
 		// Fallback: treat id as a raw products.id (Shop tab sends product IDs).
 		p, perr := s.Repo.GetProductByID(id)
 		if perr != nil {
-			return errors.New("listing not found")
+			return nil, errors.New("listing not found")
 		}
 		prod = p
 	}
 	if !prod.IsUnlimitedStock && prod.StockCount < qty {
-		return fmt.Errorf("only %d left in stock", prod.StockCount)
+		return nil, fmt.Errorf("only %d left in stock", prod.StockCount)
 	}
-	return s.Repo.AddToCart(userID, prod.ID, qty, "commerce")
+	if err := s.Repo.AddToCart(userID, prod.ID, qty, "commerce"); err != nil {
+		return nil, err
+	}
+	return prod, nil
 }
 
 // AddSdToCart adds a Supply & Demand "supply" listing to the buyer's cart.
 // It mirrors the listing onto the shop products table (via the product_id
 // bridge) and records the item's origin as "supply" so the cart screen can
-// tell supply items apart from commerce ones. The supplier is NOT notified
-// here — they only learn about the buyer once payment completes.
-func (s *ShopService) AddSdToCart(userID, sdListingID int64, qty int) error {
+// tell supply items apart from commerce ones. Returns the mirrored product
+// so the handler can notify the supplier.
+func (s *ShopService) AddSdToCart(userID, sdListingID int64, qty int) (*models.Product, error) {
 	if qty <= 0 {
-		return errors.New("quantity must be at least 1")
+		return nil, errors.New("quantity must be at least 1")
 	}
 	prod, err := s.Repo.EnsureProductForSdListing(sdListingID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if prod.UserID == userID {
-		return errors.New("you can't add your own listing to cart")
+		return nil, errors.New("you can't add your own listing to cart")
 	}
-	return s.Repo.AddToCart(userID, prod.ID, qty, "supply")
+	if err := s.Repo.AddToCart(userID, prod.ID, qty, "supply"); err != nil {
+		return nil, err
+	}
+	return prod, nil
 }
 
 func (s *ShopService) GetCart(userID int64) ([]models.CartItem, float64, error) {

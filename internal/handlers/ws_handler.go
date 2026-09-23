@@ -125,26 +125,33 @@ func (h *WSHandler) HandleWS(c *gin.Context) {
 			h.Hub.SendToUser(msg.ReceiverID, payload)
 			// For call_offer, also send a push notification so the
 			// receiver gets pinged even if they aren't on WS right now.
+			// Run async — FCM HTTP latency must not stall the WS read loop
+			// (which also relays ICE/answer frames for in-progress calls).
 			if msg.Type == "call_offer" && h.DB != nil {
-				var callerName string
-				h.DB.QueryRow("SELECT COALESCE(full_name, username) FROM users WHERE id=$1", userID).Scan(&callerName)
-				if callerName == "" {
-					callerName = "Someone"
-				}
+				db := h.DB
+				receiverID := msg.ReceiverID
+				fromUserID := userID
 				isVideo := false
 				if v, ok := extra["is_video"]; ok {
 					isVideo, _ = v.(bool)
 				}
-				mediaType := "voice"
-				if isVideo {
-					mediaType = "video"
-				}
-				services.SendPush(h.DB, msg.ReceiverID, "Incoming "+mediaType+" call",
-					callerName+" is calling you", map[string]string{
-						"type":      "call_offer",
-						"sender_id": strconv.FormatInt(userID, 10),
-						"is_video":  strconv.FormatBool(isVideo),
-					})
+				go func() {
+					var callerName string
+					db.QueryRow("SELECT COALESCE(full_name, username) FROM users WHERE id=$1", fromUserID).Scan(&callerName)
+					if callerName == "" {
+						callerName = "Someone"
+					}
+					mediaType := "voice"
+					if isVideo {
+						mediaType = "video"
+					}
+					services.SendPush(db, receiverID, "Incoming "+mediaType+" call",
+						callerName+" is calling you", map[string]string{
+							"type":      "call_offer",
+							"sender_id": strconv.FormatInt(fromUserID, 10),
+							"is_video":  strconv.FormatBool(isVideo),
+						})
+				}()
 			}
 		}
 	}

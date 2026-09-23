@@ -401,6 +401,132 @@ func runSelfHealingMigrations(db *sql.DB) error {
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS show_likes BOOLEAN NOT NULL DEFAULT true`,
 		`ALTER TABLE statuses ADD COLUMN IF NOT EXISTS music_title TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE statuses ADD COLUMN IF NOT EXISTS music_url  TEXT NOT NULL DEFAULT ''`,
+		// statuses: production table was created from vinci.sql's FIRST statuses
+		// def (type/caption), but status_handler.go reads/writes status_type and
+		// text_content — so every status feed/create 500s with "column does not
+		// exist". Add + backfill from the legacy columns (first definition wins).
+		`ALTER TABLE statuses ADD COLUMN IF NOT EXISTS status_type TEXT NOT NULL DEFAULT 'image'`,
+		`ALTER TABLE statuses ADD COLUMN IF NOT EXISTS text_content TEXT`,
+		`DO $$ BEGIN
+			IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='statuses' AND column_name='type') THEN
+				UPDATE statuses SET status_type = type
+				WHERE status_type = 'image' AND type IS NOT NULL AND type <> 'image';
+			END IF;
+			IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='statuses' AND column_name='caption') THEN
+				UPDATE statuses SET text_content = caption
+				WHERE text_content IS NULL AND caption IS NOT NULL;
+			END IF;
+		END $$;`,
+		// FTS: migration_search.sql exists in the repo but was never wired into
+		// Go — search_service.go selects search_vector on every query, so the
+		// column must exist before any /search call can succeed.
+		`CREATE EXTENSION IF NOT EXISTS pg_trgm`,
+		`ALTER TABLE posts ADD COLUMN IF NOT EXISTS search_vector tsvector`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS search_vector tsvector`,
+		`ALTER TABLE supplies ADD COLUMN IF NOT EXISTS search_vector tsvector`,
+		`ALTER TABLE demands ADD COLUMN IF NOT EXISTS search_vector tsvector`,
+		`ALTER TABLE products ADD COLUMN IF NOT EXISTS search_vector tsvector`,
+		`ALTER TABLE communities ADD COLUMN IF NOT EXISTS search_vector tsvector`,
+		`CREATE INDEX IF NOT EXISTS idx_posts_search_vector ON posts USING GIN (search_vector)`,
+		`CREATE INDEX IF NOT EXISTS idx_users_search_vector ON users USING GIN (search_vector)`,
+		`CREATE INDEX IF NOT EXISTS idx_supplies_search_vector ON supplies USING GIN (search_vector)`,
+		`CREATE INDEX IF NOT EXISTS idx_demands_search_vector ON demands USING GIN (search_vector)`,
+		`CREATE INDEX IF NOT EXISTS idx_products_search_vector ON products USING GIN (search_vector)`,
+		`CREATE INDEX IF NOT EXISTS idx_communities_search_vector ON communities USING GIN (search_vector)`,
+		`CREATE OR REPLACE FUNCTION posts_search_vector_update() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			NEW.search_vector :=
+				setweight(to_tsvector('english', COALESCE(NEW.caption, '')), 'A') ||
+				setweight(to_tsvector('english', COALESCE(NEW.location, '')), 'B') ||
+				setweight(to_tsvector('english', COALESCE(NEW.category, '')), 'B');
+			RETURN NEW;
+		END$$`,
+		`DROP TRIGGER IF EXISTS posts_search_vector_trigger ON posts`,
+		`CREATE TRIGGER posts_search_vector_trigger BEFORE INSERT OR UPDATE ON posts FOR EACH ROW EXECUTE FUNCTION posts_search_vector_update()`,
+		`CREATE OR REPLACE FUNCTION users_search_vector_update() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			NEW.search_vector :=
+				setweight(to_tsvector('english', COALESCE(NEW.username, '')), 'A') ||
+				setweight(to_tsvector('english', COALESCE(NEW.full_name, '')), 'A') ||
+				setweight(to_tsvector('english', COALESCE(NEW.bio, '')), 'B');
+			RETURN NEW;
+		END$$`,
+		`DROP TRIGGER IF EXISTS users_search_vector_trigger ON users`,
+		`CREATE TRIGGER users_search_vector_trigger BEFORE INSERT OR UPDATE ON users FOR EACH ROW EXECUTE FUNCTION users_search_vector_update()`,
+		`CREATE OR REPLACE FUNCTION supplies_search_vector_update() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			NEW.search_vector :=
+				setweight(to_tsvector('english', COALESCE(NEW.goods_name, '')), 'A') ||
+				setweight(to_tsvector('english', COALESCE(NEW.description, '')), 'B') ||
+				setweight(to_tsvector('english', COALESCE(NEW.category, '')), 'B');
+			RETURN NEW;
+		END$$`,
+		`DROP TRIGGER IF EXISTS supplies_search_vector_trigger ON supplies`,
+		`CREATE TRIGGER supplies_search_vector_trigger BEFORE INSERT OR UPDATE ON supplies FOR EACH ROW EXECUTE FUNCTION supplies_search_vector_update()`,
+		`CREATE OR REPLACE FUNCTION demands_search_vector_update() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			NEW.search_vector :=
+				setweight(to_tsvector('english', COALESCE(NEW.looking_for, '')), 'A') ||
+				setweight(to_tsvector('english', COALESCE(NEW.description, '')), 'B') ||
+				setweight(to_tsvector('english', COALESCE(NEW.category, '')), 'B');
+			RETURN NEW;
+		END$$`,
+		`DROP TRIGGER IF EXISTS demands_search_vector_trigger ON demands`,
+		`CREATE TRIGGER demands_search_vector_trigger BEFORE INSERT OR UPDATE ON demands FOR EACH ROW EXECUTE FUNCTION demands_search_vector_update()`,
+		`CREATE OR REPLACE FUNCTION products_search_vector_update() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			NEW.search_vector :=
+				setweight(to_tsvector('english', COALESCE(NEW.name, '')), 'A') ||
+				setweight(to_tsvector('english', COALESCE(NEW.description, '')), 'B') ||
+				setweight(to_tsvector('english', COALESCE(NEW.category, '')), 'B');
+			RETURN NEW;
+		END$$`,
+		`DROP TRIGGER IF EXISTS products_search_vector_trigger ON products`,
+		`CREATE TRIGGER products_search_vector_trigger BEFORE INSERT OR UPDATE ON products FOR EACH ROW EXECUTE FUNCTION products_search_vector_update()`,
+		`CREATE OR REPLACE FUNCTION communities_search_vector_update() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			NEW.search_vector :=
+				setweight(to_tsvector('english', COALESCE(NEW.name, '')), 'A') ||
+				setweight(to_tsvector('english', COALESCE(NEW.description, '')), 'B');
+			RETURN NEW;
+		END$$`,
+		`DROP TRIGGER IF EXISTS communities_search_vector_trigger ON communities`,
+		`CREATE TRIGGER communities_search_vector_trigger BEFORE INSERT OR UPDATE ON communities FOR EACH ROW EXECUTE FUNCTION communities_search_vector_update()`,
+		`UPDATE posts SET search_vector =
+			setweight(to_tsvector('english', COALESCE(caption, '')), 'A') ||
+			setweight(to_tsvector('english', COALESCE(location, '')), 'B') ||
+			setweight(to_tsvector('english', COALESCE(category, '')), 'B')
+			WHERE search_vector IS NULL`,
+		`UPDATE users SET search_vector =
+			setweight(to_tsvector('english', COALESCE(username, '')), 'A') ||
+			setweight(to_tsvector('english', COALESCE(full_name, '')), 'A') ||
+			setweight(to_tsvector('english', COALESCE(bio, '')), 'B')
+			WHERE search_vector IS NULL`,
+		`UPDATE supplies SET search_vector =
+			setweight(to_tsvector('english', COALESCE(goods_name, '')), 'A') ||
+			setweight(to_tsvector('english', COALESCE(description, '')), 'B') ||
+			setweight(to_tsvector('english', COALESCE(category, '')), 'B')
+			WHERE search_vector IS NULL`,
+		`UPDATE demands SET search_vector =
+			setweight(to_tsvector('english', COALESCE(looking_for, '')), 'A') ||
+			setweight(to_tsvector('english', COALESCE(description, '')), 'B') ||
+			setweight(to_tsvector('english', COALESCE(category, '')), 'B')
+			WHERE search_vector IS NULL`,
+		`UPDATE products SET search_vector =
+			setweight(to_tsvector('english', COALESCE(name, '')), 'A') ||
+			setweight(to_tsvector('english', COALESCE(description, '')), 'B') ||
+			setweight(to_tsvector('english', COALESCE(category, '')), 'B')
+			WHERE search_vector IS NULL`,
+		`UPDATE communities SET search_vector =
+			setweight(to_tsvector('english', COALESCE(name, '')), 'A') ||
+			setweight(to_tsvector('english', COALESCE(description, '')), 'B')
+			WHERE search_vector IS NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_users_username_trgm ON users USING GIN (username gin_trgm_ops)`,
+		`CREATE INDEX IF NOT EXISTS idx_users_fullname_trgm ON users USING GIN (full_name gin_trgm_ops)`,
+		`CREATE INDEX IF NOT EXISTS idx_posts_caption_trgm ON posts USING GIN (caption gin_trgm_ops)`,
+		`CREATE INDEX IF NOT EXISTS idx_supplies_goods_name_trgm ON supplies USING GIN (goods_name gin_trgm_ops)`,
+		`CREATE INDEX IF NOT EXISTS idx_products_name_trgm ON products USING GIN (name gin_trgm_ops)`,
+		`CREATE INDEX IF NOT EXISTS idx_communities_name_trgm ON communities USING GIN (name gin_trgm_ops)`,
 
 		// communities created before "created_by"/"visibility" existed (old
 		// schema used "owner_id"/"type") — add the columns the handlers use
@@ -676,7 +802,40 @@ func runSelfHealingMigrations(db *sql.DB) error {
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
-			return err
+			// Log-and-continue: one bad ALTER must not skip later critical
+			// columns (status_type) or refuse to boot the whole server.
+			log.Printf("warning: self-heal skipped: %v — %.120s", err, stmt)
+		}
+	}
+
+	// Critical statuses schema — always-run, independent of the main loop.
+	// Production's statuses table was created from vinci.sql's FIRST def
+	// (type/caption); status_handler.go reads/writes status_type/text_content,
+	// so without these every status feed/create 500s with "column does not
+	// exist". Error-tolerant so a failure here never blocks boot either.
+	for _, s := range []string{
+		`ALTER TABLE statuses ADD COLUMN IF NOT EXISTS status_type TEXT NOT NULL DEFAULT 'image'`,
+		`ALTER TABLE statuses ADD COLUMN IF NOT EXISTS text_content TEXT`,
+		`ALTER TABLE statuses ADD COLUMN IF NOT EXISTS music_title TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE statuses ADD COLUMN IF NOT EXISTS music_url TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE statuses ADD COLUMN IF NOT EXISTS bg_image TEXT`,
+		`ALTER TABLE statuses ADD COLUMN IF NOT EXISTS custom_ids TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE statuses ADD COLUMN IF NOT EXISTS reshared_from_id INTEGER`,
+		`ALTER TABLE statuses ADD COLUMN IF NOT EXISTS reshared_from_user_id INTEGER`,
+		`ALTER TABLE statuses ADD COLUMN IF NOT EXISTS reshared_from_username TEXT NOT NULL DEFAULT ''`,
+		`DO $$ BEGIN
+			IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='statuses' AND column_name='type') THEN
+				UPDATE statuses SET status_type = type
+				WHERE status_type = 'image' AND type IS NOT NULL AND type <> 'image';
+			END IF;
+			IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='statuses' AND column_name='caption') THEN
+				UPDATE statuses SET text_content = caption
+				WHERE text_content IS NULL AND caption IS NOT NULL;
+			END IF;
+		END $$;`,
+	} {
+		if _, err := db.Exec(s); err != nil {
+			log.Printf("warning: statuses self-heal: %v", err)
 		}
 	}
 	return nil
@@ -975,6 +1134,7 @@ func runNewFeatureMigrations(db *sql.DB) error {
 		// Notification prefs: mentions, community mentions & ask (Demand & Supply matches)
 		`ALTER TABLE notification_preferences ADD COLUMN IF NOT EXISTS mentions BOOLEAN NOT NULL DEFAULT true`,
 		`ALTER TABLE notification_preferences ADD COLUMN IF NOT EXISTS community_mentions BOOLEAN NOT NULL DEFAULT true`,
+		`ALTER TABLE notification_preferences ADD COLUMN IF NOT EXISTS cart_adds BOOLEAN NOT NULL DEFAULT true`,
 		`ALTER TABLE notification_preferences ADD COLUMN IF NOT EXISTS ask BOOLEAN NOT NULL DEFAULT true`,
 	}
 	for _, s := range stmts {

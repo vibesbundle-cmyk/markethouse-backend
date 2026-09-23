@@ -643,7 +643,7 @@ func (r *MessageRepo) LogCall(senderID, receiverID int64, callType string, durat
 // participant's name, username, and profile photo resolved from the users table.
 func (r *MessageRepo) GetCallLogs(userID int64) ([]map[string]interface{}, error) {
 	rows, err := r.DB.Query(`
-		SELECT cl.id,
+		SELECT cl.id, cl.caller_id,
 			CASE WHEN cl.caller_id = $1 THEN cl.receiver_id ELSE cl.caller_id END AS other_user_id,
 			CASE WHEN cl.caller_id = $1 THEN COALESCE(u.full_name,'') ELSE COALESCE(u2.full_name,'') END AS other_name,
 			CASE WHEN cl.caller_id = $1 THEN COALESCE(u.username,'') ELSE COALESCE(u2.username,'') END AS other_username,
@@ -661,16 +661,17 @@ func (r *MessageRepo) GetCallLogs(userID int64) ([]map[string]interface{}, error
 	defer rows.Close()
 	var list []map[string]interface{}
 	for rows.Next() {
-		var id, otherID int64
+		var id, callerID, otherID int64
 		var otherName, otherUsername, otherPhoto, callType, endedBy string
 		var duration int
 		var createdAt string
-		if err := rows.Scan(&id, &otherID, &otherName, &otherUsername, &otherPhoto,
+		if err := rows.Scan(&id, &callerID, &otherID, &otherName, &otherUsername, &otherPhoto,
 			&callType, &duration, &endedBy, &createdAt); err != nil {
 			return nil, err
 		}
 		list = append(list, map[string]interface{}{
 			"id":               id,
+			"caller_id":        callerID,
 			"other_user_id":    otherID,
 			"other_user_name":  otherName,
 			"other_username":   otherUsername,

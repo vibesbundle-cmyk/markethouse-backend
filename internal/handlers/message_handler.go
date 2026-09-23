@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"encoding/json"
+	"fmt"
 	"log"
 	"markethouse/internal/models"
 	"markethouse/internal/services"
@@ -91,7 +93,37 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 					"conversation_id": strconv.FormatInt(result.ConversationID, 10),
 					"sender_id":       strconv.FormatInt(senderID, 10),
 				}
-				log.Printf("dm push: sending to user=%d conv=%d title=%q", req.ReceiverID, result.ConversationID, title)
+				// Status replies ride as JSON content (caption + status_quote).
+				// Make the tray body say so and hand the client a quote preview.
+				if replyText, isStatus := statusReplyCaption(req.Content); isStatus {
+					if replyText == "" {
+						body = "Replied to your status"
+					} else {
+						body = "Replied to your status: " + truncateRunes(replyText, 120)
+					}
+					data["is_status_reply"] = "true"
+					if q := statusQuoteText(req.Content); q != "" {
+						data["reply_preview"] = truncateRunes(q, 120)
+					}
+				} else if req.ReplyToID != nil && *req.ReplyToID > 0 {
+					// Regular message reply — prefix the tray body with the
+					// quoted text so the push itself shows it's a reply.
+					var quoted string
+					db.QueryRow(`SELECT COALESCE(content,'') FROM messages WHERE id=$1`,
+						*req.ReplyToID).Scan(&quoted)
+					qPreview := quotedPreview(quoted)
+					if qPreview != "" {
+						body = fmt.Sprintf("Replying to %q: %s", truncateRunes(qPreview, 60), body)
+						data["reply_preview"] = truncateRunes(qPreview, 120)
+					}
+					data["reply_to_id"] = strconv.FormatInt(*req.ReplyToID, 10)
+				}
+				if len(body) > 300 {
+					body = truncateRunes(body, 300)
+				}
+				log.Printf("dm push: sending to user=%d conv=%d title=%q reply=%v status=%v",
+					req.ReceiverID, result.ConversationID, title,
+					data["reply_to_id"] != "", data["is_status_reply"] == "true")
 				go services.SendPush(db, req.ReceiverID, title, body, data)
 			}
 		}
@@ -104,6 +136,13 @@ func (h *MessageHandler) SendMessage(c *gin.Context) {
 func pushPreview(msgType, content string) string {
 	content = strings.TrimSpace(content)
 	if content == "" || (len(content) > 0 && content[0] == '{') {
+		// Status-reply JSON: the caption is the actual reply text.
+		if cap, ok := statusReplyCaption(content); ok {
+			if cap == "" {
+				return "Replied to your status"
+			}
+			return truncateRunes(cap, 120)
+		}
 		switch msgType {
 		case "image":
 			return "Sent a photo"
@@ -121,12 +160,63 @@ func pushPreview(msgType, content string) string {
 			return "Sent a message"
 		}
 	}
-	const max = 120
-	runes := []rune(content)
-	if len(runes) > max {
-		return string(runes[:max]) + "…"
+	return truncateRunes(content, 120)
+}
+
+// statusReplyCaption returns the reply text of a status-reply JSON payload
+// (the same shape the Flutter client writes in _statusReplyContent).
+func statusReplyCaption(content string) (string, bool) {
+	c := strings.TrimSpace(content)
+	if !strings.HasPrefix(c, "{") || !strings.Contains(c, `"status_quote"`) {
+		return "", false
 	}
-	return content
+	var payload struct {
+		Caption     string                 `json:"caption"`
+		StatusQuote map[string]interface{} `json:"status_quote"`
+	}
+	if err := json.Unmarshal([]byte(c), &payload); err != nil || payload.StatusQuote == nil {
+		return "", false
+	}
+	return strings.TrimSpace(payload.Caption), true
+}
+
+// statusQuoteText pulls the original status text (optional) out of a
+// status-reply payload so the client can rebuild the reply bar.
+func statusQuoteText(content string) string {
+	var payload struct {
+		StatusQuote struct {
+			Text string `json:"text"`
+		} `json:"status_quote"`
+	}
+	if err := json.Unmarshal([]byte(content), &payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.StatusQuote.Text)
+}
+
+// quotedPreview is a one-line preview of a message being replied to.
+func quotedPreview(content string) string {
+	c := strings.TrimSpace(content)
+	if c == "" {
+		return ""
+	}
+	if cap, ok := statusReplyCaption(c); ok {
+		if cap != "" {
+			return cap
+		}
+		return "their status"
+	}
+	if c[0] == '{' {
+		// Other JSON payloads (captioned media etc.) — try caption only.
+		var payload struct {
+			Caption string `json:"caption"`
+		}
+		if err := json.Unmarshal([]byte(c), &payload); err == nil && payload.Caption != "" {
+			return strings.TrimSpace(payload.Caption)
+		}
+		return pushPreview("text", c)
+	}
+	return truncateRunes(c, 80)
 }
 
 func (h *MessageHandler) GetHistory(c *gin.Context) {
@@ -235,6 +325,18 @@ func (h *MessageHandler) ClearConversation(c *gin.Context) {
 	userID := c.GetInt64("user_id")
 	convID, _ := strconv.ParseInt(c.Param("conv_id"), 10, 64)
 	if err := h.Service.ClearChat(convID, userID); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"ok": true})
+}
+
+// POST /conversation/:conv_id/read — mark unread messages read without
+// loading history (notification "Mark as read" action).
+func (h *MessageHandler) MarkRead(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	convID, _ := strconv.ParseInt(c.Param("conv_id"), 10, 64)
+	if err := h.Service.MarkRead(convID, userID); err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}

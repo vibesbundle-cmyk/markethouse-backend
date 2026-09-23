@@ -101,7 +101,9 @@ func (r *InteractionRepo) GetSavedPosts(userID int64) ([]map[string]interface{},
 		(SELECT COUNT(*) FROM likes WHERE post_id = p.id) as like_count,
 		(SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comment_count,
 		EXISTS(SELECT 1 FROM likes WHERE post_id=p.id AND user_id=$1) as is_liked,
-		EXISTS(SELECT 1 FROM saves WHERE post_id=p.id AND user_id=$1) as is_saved
+		EXISTS(SELECT 1 FROM saves WHERE post_id=p.id AND user_id=$1) as is_saved,
+		EXISTS(SELECT 1 FROM post_reshare WHERE post_id=p.id AND user_id=$1) as is_reshared,
+		(SELECT COUNT(*) FROM post_reshare WHERE post_id = p.id) as reshare_count
 	FROM saves s
 	JOIN posts p ON p.id = s.post_id
 	JOIN users u ON p.user_id = u.id

@@ -95,12 +95,12 @@ func (s *SearchService) Search(opts SearchOptions) ([]SearchResult, error) {
 			continue // Skip failed types, don't fail entire search
 		}
 		results = append(results, typeResults...)
+	}
 
 	// Cache results (TTL: posts/users 30s, marketplace 60s, communities 5m)
 	if s.Redis != nil && opts.UserID == 0 && opts.Offset == 0 {
 		ttl := s.cacheTTL(opts.Types)
 		_ = s.setCached(cacheKey, results, ttl)
-	}
 	}
 
 	// Track popular search queries (analytics)
@@ -130,10 +130,12 @@ func (s *SearchService) searchPosts(tsQuery, prefixQuery string, opts SearchOpti
 			u.id as user_id,
 			u.username,
 			u.profile_photo,
+			(SELECT COUNT(*) FROM likes WHERE post_id = p.id) as like_count,
 			ts_rank_cd(p.search_vector, websearch_to_tsquery('english', $1)) as rank
 		FROM posts p
 		JOIN users u ON p.user_id = u.id
-		WHERE p.search_vector @@ websearch_to_tsquery('english', $1)
+		WHERE (p.search_vector @@ websearch_to_tsquery('english', $1)
+			OR p.caption ILIKE '%' || $1 || '%')
 	`
 	args := []interface{}{tsQuery}
 	argIdx := 2
@@ -182,10 +184,11 @@ func (s *SearchService) searchPosts(tsQuery, prefixQuery string, opts SearchOpti
 		var caption, mediaURL, mediaType, category, location, createdAt sql.NullString
 		var userID sql.NullInt64
 		var username, profilePhoto sql.NullString
+		var likeCount sql.NullInt64
 		var rank sql.NullFloat64
 
 		err := rows.Scan(&r.ID, &caption, &mediaURL, &mediaType, &category, &location, &createdAt,
-			&userID, &username, &profilePhoto, &rank)
+			&userID, &username, &profilePhoto, &likeCount, &rank)
 		if err != nil {
 			return nil, err
 		}
@@ -199,11 +202,15 @@ func (s *SearchService) searchPosts(tsQuery, prefixQuery string, opts SearchOpti
 		r.Image = mediaURL.String
 		r.Score = rank.Float64
 		r.Extra = map[string]interface{}{
-			"media_type": mediaType.String,
-			"category":   category.String,
-			"location":   location.String,
-			"created_at": createdAt.String,
-			"user_id":    userID.Int64,
+			"caption_full":  caption.String,
+			"username":      username.String,
+			"profile_photo": profilePhoto.String,
+			"media_type":    mediaType.String,
+			"category":      category.String,
+			"location":      location.String,
+			"created_at":    createdAt.String,
+			"user_id":       userID.Int64,
+			"like_count":    likeCount.Int64,
 		}
 		results = append(results, r)
 	}
@@ -224,15 +231,18 @@ func (s *SearchService) searchUsers(tsQuery, prefixQuery string, opts SearchOpti
 			u.is_verified,
 			ts_rank_cd(u.search_vector, websearch_to_tsquery('english', $1)) as rank
 		FROM users u
-		WHERE u.search_vector @@ websearch_to_tsquery('english', $1)
-		AND u.username IS NOT NULL
+		WHERE u.username IS NOT NULL
+			AND (u.username ILIKE '%' || $1 || '%'
+				OR u.full_name ILIKE '%' || $1 || '%'
+				OR COALESCE(u.bio,'') ILIKE '%' || $1 || '%'
+				OR u.search_vector @@ websearch_to_tsquery('english', $1))
 	`
 	args := []interface{}{tsQuery}
 
 	if opts.SortBy == "recent" {
 		query += ` ORDER BY u.created_at DESC`
 	} else {
-		query += ` ORDER BY rank DESC, u.is_verified DESC, u.created_at DESC`
+		query += ` ORDER BY (u.search_vector @@ websearch_to_tsquery('english', $1)) DESC, rank DESC NULLS LAST, u.is_verified DESC, u.created_at DESC`
 	}
 
 	query += ` LIMIT $2 OFFSET $3`
@@ -240,7 +250,25 @@ func (s *SearchService) searchUsers(tsQuery, prefixQuery string, opts SearchOpti
 
 	rows, err := s.DB.Query(query, args...)
 	if err != nil {
-		return nil, err
+		// search_vector may still be missing on a production DB that has not
+		// booted the FTS migration yet — fall back to pure ILIKE so name
+		// search never hard-fails.
+		fallback := `
+			SELECT 
+				u.id, u.username, u.full_name, u.bio, u.profile_photo,
+				u.account_type, u.business_name, u.business_category, u.is_verified,
+				0::float8 as rank
+			FROM users u
+			WHERE u.username IS NOT NULL
+				AND (u.username ILIKE '%' || $1 || '%'
+					OR u.full_name ILIKE '%' || $1 || '%'
+					OR COALESCE(u.bio,'') ILIKE '%' || $1 || '%')
+			ORDER BY u.is_verified DESC, u.created_at DESC
+			LIMIT $2 OFFSET $3`
+		rows, err = s.DB.Query(fallback, tsQuery, opts.Limit, opts.Offset)
+		if err != nil {
+			return nil, err
+		}
 	}
 	defer rows.Close()
 
@@ -568,16 +596,17 @@ func (s *SearchService) searchCommunities(tsQuery, prefixQuery string, opts Sear
 		SELECT 
 			c.id,
 			c.name,
-			c.slug,
-			c.description,
-			c.icon,
-			c.cover_photo,
-			c.member_count,
-			c.type,
-			c.created_at,
+			COALESCE(c.slug,''),
+			COALESCE(c.description,''),
+			COALESCE(c.icon,''),
+			COALESCE(c.cover_photo,''),
+			COALESCE(c.member_count,0),
+			COALESCE(c.category,''),
+			COALESCE(c.visibility,'public'),
 			ts_rank_cd(c.search_vector, websearch_to_tsquery('english', $1)) as rank
 		FROM communities c
-		WHERE c.search_vector @@ websearch_to_tsquery('english', $1)
+		WHERE (c.search_vector @@ websearch_to_tsquery('english', $1)
+			OR c.name ILIKE '%' || $1 || '%')
 	`
 	args := []interface{}{tsQuery}
 
@@ -593,12 +622,12 @@ func (s *SearchService) searchCommunities(tsQuery, prefixQuery string, opts Sear
 	var results []SearchResult
 	for rows.Next() {
 		var r SearchResult
-		var name, slug, description, icon, coverPhoto, ctype, createdAt sql.NullString
+		var name, slug, description, icon, coverPhoto, category, visibility sql.NullString
 		var memberCount sql.NullInt64
 		var rank sql.NullFloat64
 
 		err := rows.Scan(&r.ID, &name, &slug, &description, &icon, &coverPhoto,
-			&memberCount, &ctype, &createdAt, &rank)
+			&memberCount, &category, &visibility, &rank)
 		if err != nil {
 			return nil, err
 		}
@@ -618,7 +647,8 @@ func (s *SearchService) searchCommunities(tsQuery, prefixQuery string, opts Sear
 			"slug":          slug.String,
 			"description":   description.String,
 			"member_count":  memberCount.Int64,
-			"type":          ctype.String,
+			"category":      category.String,
+			"type":          visibility.String,
 			"cover_photo":   coverPhoto.String,
 		}
 		results = append(results, r)

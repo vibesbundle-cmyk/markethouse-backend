@@ -60,7 +60,147 @@ func (h *SearchHandler) Search(c *gin.Context) {
 		"query":   query,
 		"results": results,
 		"count":   len(results),
+		// Legacy client shape: GlobalSearchScreen / searchUsers / SearchTabbedResults
+		// read people/communities/posts (and expect caption/username/profile_photo
+		// flattened onto each post, name/icon on communities, profile_photo on users).
+		"people":      groupSearchPeople(results),
+		"communities": groupSearchCommunities(results),
+		"posts":       groupSearchPosts(results),
+		"marketplace": groupSearchMarketplace(results),
 	})
+}
+
+// groupSearch* flatten SearchResult (+ Extra) into the maps the Flutter client
+// already renders, so /search keeps one endpoint while serving both shapes.
+func groupSearchPeople(results []services.SearchResult) []map[string]interface{} {
+	out := []map[string]interface{}{}
+	for _, r := range results {
+		if r.Type != "users" {
+			continue
+		}
+		m := map[string]interface{}{
+			"id":            r.ID,
+			"username":      extraStr(r, "username"),
+			"full_name":     extraStr(r, "full_name"),
+			"bio":           extraStr(r, "bio"),
+			"profile_photo": r.Image,
+			"is_verified":   extraBool(r, "is_verified"),
+			"title":         r.Title,
+			"subtitle":      r.Subtitle,
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+func groupSearchCommunities(results []services.SearchResult) []map[string]interface{} {
+	out := []map[string]interface{}{}
+	for _, r := range results {
+		if r.Type != "communities" {
+			continue
+		}
+		m := map[string]interface{}{
+			"id":           r.ID,
+			"name":         r.Title,
+			"icon":         r.Image,
+			"slug":         extraStr(r, "slug"),
+			"description":  extraStr(r, "description"),
+			"member_count": extraNum(r, "member_count"),
+			"category":     extraStr(r, "category"),
+			"type":         extraStr(r, "type"),
+			"cover_photo":  extraStr(r, "cover_photo"),
+			"title":        r.Title,
+			"subtitle":     r.Subtitle,
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+func groupSearchPosts(results []services.SearchResult) []map[string]interface{} {
+	out := []map[string]interface{}{}
+	for _, r := range results {
+		if r.Type != "posts" {
+			continue
+		}
+		username := extraStr(r, "username")
+		if username == "" {
+			username = strings.TrimPrefix(r.Subtitle, "@")
+			if i := strings.Index(username, " "); i >= 0 {
+				username = username[:i]
+			}
+		}
+		m := map[string]interface{}{
+			"id":            r.ID,
+			"caption":       extraStr(r, "caption_full"),
+			"username":      username,
+			"profile_photo": extraStr(r, "profile_photo"),
+			"media_url":     r.Image,
+			"media_type":    extraStr(r, "media_type"),
+			"category":      extraStr(r, "category"),
+			"location":      extraStr(r, "location"),
+			"created_at":    extraStr(r, "created_at"),
+			"user_id":       extraNum(r, "user_id"),
+			"like_count":    extraNum(r, "like_count"),
+			"title":         r.Title,
+			"subtitle":      r.Subtitle,
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+func groupSearchMarketplace(results []services.SearchResult) []map[string]interface{} {
+	out := []map[string]interface{}{}
+	for _, r := range results {
+		if r.Type == "users" || r.Type == "communities" || r.Type == "posts" {
+			continue
+		}
+		m := map[string]interface{}{
+			"id":       r.ID,
+			"type":     r.Type,
+			"title":    r.Title,
+			"subtitle": r.Subtitle,
+			"image":    r.Image,
+		}
+		for k, v := range r.Extra {
+			m[k] = v
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+func extraStr(r services.SearchResult, key string) string {
+	if v, ok := r.Extra[key]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+func extraNum(r services.SearchResult, key string) float64 {
+	if v, ok := r.Extra[key]; ok {
+		switch n := v.(type) {
+		case float64:
+			return n
+		case int64:
+			return float64(n)
+		case int:
+			return float64(n)
+		}
+	}
+	return 0
+}
+
+func extraBool(r services.SearchResult, key string) bool {
+	if v, ok := r.Extra[key]; ok {
+		if b, ok := v.(bool); ok {
+			return b
+		}
+	}
+	return false
 }
 
 func (h *SearchHandler) Autocomplete(c *gin.Context) {
@@ -146,7 +286,13 @@ func (h *SearchHandler) SearchUsers(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"users": results})
+	// Same flattened shape the Flutter client already reads from `people`
+	// (Api.searchUsers / SearchTabbedResults / GlobalSearchScreen).
+	c.JSON(http.StatusOK, gin.H{
+		"users":  results,
+		"people": groupSearchPeople(results),
+		"count":  len(results),
+	})
 }
 
 // SearchMarketplace searches supplies, demands, products

@@ -67,6 +67,25 @@ func (s *MessageService) ClearChat(convID, userID int64) error {
 	return s.Repo.ClearConversation(convID, userID)
 }
 
+// MarkRead flags every unread message the user received as read and tells
+// the other participant — used by the notification "Mark as read" action
+// so unread badges clear without loading full history.
+func (s *MessageService) MarkRead(convID, userID int64) error {
+	if err := s.Repo.MarkMessagesRead(convID, userID); err != nil {
+		return err
+	}
+	if s.Hub != nil {
+		if conv, err := s.Repo.GetConversation(convID, userID); err == nil {
+			s.Hub.SendToUser(conv.OtherUserID, map[string]interface{}{
+				"type":            "messages_read",
+				"conversation_id": convID,
+				"reader_id":       userID,
+			})
+		}
+	}
+	return nil
+}
+
 // HideChat hides a conversation from the caller's chat list.
 func (s *MessageService) HideChat(convID, userID int64) error {
 	return s.Repo.HideConversation(convID, userID)

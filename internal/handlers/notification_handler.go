@@ -54,10 +54,11 @@ func PushNotification(db *sql.DB, toUserID, actorID int64, ntype, title, body, e
 	db.Exec(`INSERT INTO notifications(user_id,actor_id,type,title,body,entity_type,entity_id) VALUES($1,$2,$3,$4,$5,$6,$7)`,
 		toUserID, actorID, ntype, title, body, entityType, entityID)
 	services.SendPush(db, toUserID, title, body, map[string]string{
-		"type":        ntype,
-		"entity_type": entityType,
-		"entity_id":   strconv.FormatInt(entityID, 10),
-		"actor_id":    strconv.FormatInt(actorID, 10),
+		"type":           ntype,
+		"entity_type":    entityType,
+		"entity_id":      strconv.FormatInt(entityID, 10),
+		"actor_id":       strconv.FormatInt(actorID, 10),
+		"actor_username": userName(db, actorID),
 	})
 }
 
@@ -104,10 +105,11 @@ func NotifyWithWS(db *sql.DB, hub *services.Hub, toUserID, actorID int64, ntype,
 		})
 	}
 	services.SendPush(db, toUserID, title, body, map[string]string{
-		"type":        ntype,
-		"entity_type": entityType,
-		"entity_id":   strconv.FormatInt(entityID, 10),
-		"actor_id":    strconv.FormatInt(actorID, 10),
+		"type":           ntype,
+		"entity_type":    entityType,
+		"entity_id":      strconv.FormatInt(entityID, 10),
+		"actor_id":       strconv.FormatInt(actorID, 10),
+		"actor_username": userName(db, actorID),
 	})
 }
 
@@ -122,6 +124,7 @@ type NotifPrefs struct {
 	Views             bool `json:"views"`
 	Mentions          bool `json:"mentions"`
 	CommunityMentions bool `json:"community_mentions"`
+	CartAdds          bool `json:"cart_adds"`
 	Ask               bool `json:"ask"`
 }
 
@@ -134,10 +137,12 @@ var prefColumns = map[string]string{
 	"community_tag":     "community_mentions",
 	"transaction":       "wallet",
 	"like":              "likes",
+	"status_reaction":   "likes",
 	"comment":           "comments",
 	"reshare":           "reshares",
 	"view":              "views",
 	"tag":               "mentions",
+	"cart_add":          "cart_adds",
 	"supply_match":      "ask",
 	"demand_match":      "ask",
 	"buyer_interested":  "ask",
@@ -171,9 +176,9 @@ func notifyAllowed(db *sql.DB, userID int64, ntype string) bool {
 
 func (h *NotificationHandler) GetPrefs(c *gin.Context) {
 	userID := c.GetInt64("user_id")
-	p := NotifPrefs{Master: true, CommunityMessages: true, Wallet: true, Likes: true, Comments: true, Reshares: true, Views: true, Mentions: true, CommunityMentions: true, Ask: true}
-	h.DB.QueryRow(`SELECT master, community_messages, wallet, likes, comments, reshares, views, mentions, community_mentions, ask FROM notification_preferences WHERE user_id=$1`, userID).
-		Scan(&p.Master, &p.CommunityMessages, &p.Wallet, &p.Likes, &p.Comments, &p.Reshares, &p.Views, &p.Mentions, &p.CommunityMentions, &p.Ask)
+	p := NotifPrefs{Master: true, CommunityMessages: true, Wallet: true, Likes: true, Comments: true, Reshares: true, Views: true, Mentions: true, CommunityMentions: true, CartAdds: true, Ask: true}
+	h.DB.QueryRow(`SELECT master, community_messages, wallet, likes, comments, reshares, views, mentions, community_mentions, cart_adds, ask FROM notification_preferences WHERE user_id=$1`, userID).
+		Scan(&p.Master, &p.CommunityMessages, &p.Wallet, &p.Likes, &p.Comments, &p.Reshares, &p.Views, &p.Mentions, &p.CommunityMentions, &p.CartAdds, &p.Ask)
 	c.JSON(200, p)
 }
 
@@ -181,13 +186,14 @@ func (h *NotificationHandler) UpdatePrefs(c *gin.Context) {
 	userID := c.GetInt64("user_id")
 	var p NotifPrefs
 	c.ShouldBindJSON(&p)
-	h.DB.Exec(`INSERT INTO notification_preferences(user_id, master, community_messages, wallet, likes, comments, reshares, views, mentions, community_mentions, ask)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+	h.DB.Exec(`INSERT INTO notification_preferences(user_id, master, community_messages, wallet, likes, comments, reshares, views, mentions, community_mentions, cart_adds, ask)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 		ON CONFLICT (user_id) DO UPDATE SET
 			master=EXCLUDED.master, community_messages=EXCLUDED.community_messages, wallet=EXCLUDED.wallet,
 			likes=EXCLUDED.likes, comments=EXCLUDED.comments, reshares=EXCLUDED.reshares, views=EXCLUDED.views,
-			mentions=EXCLUDED.mentions, community_mentions=EXCLUDED.community_mentions, ask=EXCLUDED.ask`,
-		userID, p.Master, p.CommunityMessages, p.Wallet, p.Likes, p.Comments, p.Reshares, p.Views, p.Mentions, p.CommunityMentions, p.Ask)
+			mentions=EXCLUDED.mentions, community_mentions=EXCLUDED.community_mentions,
+			cart_adds=EXCLUDED.cart_adds, ask=EXCLUDED.ask`,
+		userID, p.Master, p.CommunityMessages, p.Wallet, p.Likes, p.Comments, p.Reshares, p.Views, p.Mentions, p.CommunityMentions, p.CartAdds, p.Ask)
 	c.JSON(200, gin.H{"ok": true})
 }
 

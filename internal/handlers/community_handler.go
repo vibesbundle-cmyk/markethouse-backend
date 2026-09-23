@@ -1577,7 +1577,7 @@ func canManageRoles(role string) bool { return role == "owner" || role == "admin
 func (h *CommunityHandler) GetMembers(c *gin.Context) {
 	commID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
 	rows, err := h.DB.Query(`
-		SELECT u.id, u.username, COALESCE(u.profile_photo,''), cm.role, cm.status,
+		SELECT u.id, u.username, COALESCE(u.full_name,''), COALESCE(u.profile_photo,''), cm.role, cm.status,
 		       COALESCE(u.reputation,0), cm.joined_at, COALESCE(cm.custom_title,''),
 		       COALESCE(cts.allow_tagging,true)
 		FROM community_members cm
@@ -1593,13 +1593,13 @@ func (h *CommunityHandler) GetMembers(c *gin.Context) {
 	var members []gin.H
 	for rows.Next() {
 		var uid, rep int64
-		var uname, photo, role, status, joinedAt, customTitle string
+		var uname, fname, photo, role, status, joinedAt, customTitle string
 		var taggingAllowed bool
-		if rows.Scan(&uid, &uname, &photo, &role, &status, &rep, &joinedAt, &customTitle, &taggingAllowed) != nil {
+		if rows.Scan(&uid, &uname, &fname, &photo, &role, &status, &rep, &joinedAt, &customTitle, &taggingAllowed) != nil {
 			continue
 		}
 		members = append(members, gin.H{
-			"user_id": uid, "username": uname, "profile_photo": photo,
+			"user_id": uid, "username": uname, "full_name": fname, "profile_photo": photo,
 			"role": role, "status": status, "reputation": rep, "joined_at": joinedAt,
 			"badges":        computeBadgesForHandler(rep),
 			"custom_title":  customTitle,
@@ -2152,49 +2152,96 @@ func (h *CommunityHandler) SendMessage(c *gin.Context) {
 	}
 
 	// @mentions → notification for each member named in the body (never for
-	// the sender, never duplicated within one message).
+	// the sender, never duplicated within one message). @all / @everyone from
+	// a moderator tags every active member with community_mention.
 	var commName string
 	h.DB.QueryRow(`SELECT name FROM communities WHERE id=$1`, commID).Scan(&commName)
 
-	// Only notify the person this message is actually directed at:
-	//  - the author of the message being replied to, and
-	//  - anyone @mentioned (handled in the loop below).
-	// We deliberately do NOT ping every member on every message.
+	// Notify every active member except the sender. Mentions still get a
+	// dedicated community_mention push (richer copy); the reply author and
+	// everyone else get community_message. Runs async so a large room
+	// doesn't stall the HTTP response or the WS read loop.
+	notified := map[int64]bool{callerID: true}
 	if replyTo.Valid {
 		var replyAuthor int64
 		if h.DB.QueryRow(`SELECT user_id FROM community_messages WHERE id=$1`, replyTo.Int64).Scan(&replyAuthor) == nil && replyAuthor != callerID {
 			NotifyWithWS(h.DB, h.Hub, replyAuthor, callerID, "community_message",
 				username+" replied to you in "+commName,
 				truncateRunes(req.Body, 80), "community", commID)
+			notified[replyAuthor] = true
+		}
+	}
+
+	// Moderator @all / @everyone → community_mention for every active member.
+	if canModerate(role) && allMentionRe.MatchString(req.Body) {
+		amRows, amErr := h.DB.Query(`SELECT user_id FROM community_members
+			WHERE community_id=$1 AND status='active'`, commID)
+		if amErr == nil {
+			func() {
+				defer amRows.Close()
+				for amRows.Next() {
+					var uid int64
+					if amRows.Scan(&uid) != nil || uid == callerID || notified[uid] {
+						continue
+					}
+					NotifyWithWS(h.DB, h.Hub, uid, callerID, "community_mention",
+						username+" tagged you in "+commName,
+						"", "community", commID)
+					notified[uid] = true
+				}
+			}()
 		}
 	}
 
 	for _, m := range mentionRe.FindAllStringSubmatch(req.Body, -1) {
+		if strings.EqualFold(m[1], "all") || strings.EqualFold(m[1], "everyone") {
+			continue // handled above (moderator-only)
+		}
 		var mentioned int64
 		err := h.DB.QueryRow(`SELECT cm.user_id FROM community_members cm
 			JOIN users u ON u.id=cm.user_id
 			WHERE cm.community_id=$1 AND cm.status='active' AND LOWER(u.username)=LOWER($2)`,
 			commID, m[1]).Scan(&mentioned)
-		if err != nil || mentioned == callerID {
+		if err != nil || mentioned == callerID || notified[mentioned] {
 			continue
 		}
-		PushNotification(h.DB, mentioned, callerID, "community_mention",
-			username+" mentioned you in "+commName,
-			truncateRunes(req.Body, 80), "community", commID)
-		if h.Hub != nil {
-			h.Hub.SendToUser(mentioned, gin.H{
-				"type": "notification", "notif_type": "community_mention",
-				"title": username + " mentioned you",
-				"body":  truncateRunes(req.Body, 80),
-				"community_id": commID, "message_id": id,
-				"actor_username": username, "actor_photo": photo,
-			})
-		}
+		NotifyWithWS(h.DB, h.Hub, mentioned, callerID, "community_mention",
+			username+" tagged you in "+commName,
+			"", "community", commID)
+		notified[mentioned] = true
 	}
+
+	// Remaining active members (not sender / reply / mention) — one goroutine
+	// so N FCM calls don't block the request. Snapshot the skip-set first so
+	// the goroutine only reads a private copy (maps aren't concurrency-safe).
+	skip := make(map[int64]bool, len(notified))
+	for k, v := range notified {
+		skip[k] = v
+	}
+	go func() {
+		rows, err := h.DB.Query(`SELECT user_id FROM community_members
+			WHERE community_id=$1 AND status='active'`, commID)
+		if err != nil {
+			return
+		}
+		defer rows.Close()
+		title := username + " sent a message in " + commName
+		preview := truncateRunes(req.Body, 80)
+		for rows.Next() {
+			var uid int64
+			if rows.Scan(&uid) != nil || skip[uid] {
+				continue
+			}
+			NotifyWithWS(h.DB, h.Hub, uid, callerID, "community_message",
+				title, preview, "community", commID)
+		}
+	}()
 	c.JSON(200, gin.H{"id": id, "created_at": createdAt})
 }
 
 var mentionRe = regexp.MustCompile(`@([A-Za-z0-9_]{3,30})`)
+
+var allMentionRe = regexp.MustCompile(`(?i)@(all|everyone)\b`)
 
 var linkRe = regexp.MustCompile(`(?i)(https?://|www\.|t\.me/|chat\.whatsapp\.com)`)
 

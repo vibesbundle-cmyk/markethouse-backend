@@ -221,8 +221,9 @@ func SetupRouter(
 	auth.PUT("/message/:msg_id", messageHandler.EditMessage)
 	auth.DELETE("/message/:msg_id", messageHandler.DeleteMessage)
 	auth.PUT("/conversation/:conv_id/settings", messageHandler.UpdateConversationSettings)
+	auth.POST("/conversation/:conv_id/read", messageHandler.MarkRead)
 	auth.POST("/conversation/:conv_id/clear", messageHandler.ClearConversation)
- auth.POST("/conversation/:conv_id/hide", messageHandler.HideConversation)
+	auth.POST("/conversation/:conv_id/hide", messageHandler.HideConversation)
  auth.POST("/conversation/:conv_id/purge", messageHandler.PurgeConversation)
 
 	// ── CALL LOGS ──────────────────────────────────────────────────

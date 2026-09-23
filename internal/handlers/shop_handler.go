@@ -93,6 +93,24 @@ func (h *ShopHandler) MyProducts(c *gin.Context) {
 // CART
 // ─────────────────────────────────────────────────────────────────────────────
 
+// notifyCartAdd tells the seller someone put their item in a cart
+// (persistent notification + WS + FCM push). Skips self-adds and nil product.
+func (h *ShopHandler) notifyCartAdd(buyerID int64, prod *models.Product) {
+	if prod == nil || prod.UserID == 0 || prod.UserID == buyerID {
+		return
+	}
+	if h.Service == nil || h.Service.Repo == nil || h.Service.Repo.DB == nil {
+		return
+	}
+	db := h.Service.Repo.DB
+	buyer := userName(db, buyerID)
+	NotifyWithWS(db, h.Hub, prod.UserID, buyerID, "cart_add",
+		buyer+" added your item to cart",
+		"\""+prod.Name+"\" was added to someone's cart",
+		"product", prod.ID)
+	log.Printf("cart push: seller=%d buyer=%d product=%d", prod.UserID, buyerID, prod.ID)
+}
+
 // POST /shop/cart
 func (h *ShopHandler) AddToCart(c *gin.Context) {
 	userID := c.GetInt64("user_id")
@@ -104,16 +122,19 @@ func (h *ShopHandler) AddToCart(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if err := h.Service.AddToCart(userID, req.ProductID, req.Quantity); err != nil {
+	prod, err := h.Service.AddToCart(userID, req.ProductID, req.Quantity)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	h.notifyCartAdd(userID, prod)
 	c.JSON(http.StatusOK, gin.H{"message": "added to cart"})
 }
 
 // POST /supply-demand/:id/cart — add a Supply & Demand "supply" listing to the
 // buyer's real cart (mirrored onto the shop products table with origin='supply').
-// The supplier is NOT notified here; they only learn once the buyer pays.
+// The supplier is notified (cart push) so they can prepare; payment still
+// only reveals full buyer details later.
 func (h *ShopHandler) AddSdToCart(c *gin.Context) {
 	userID := c.GetInt64("user_id")
 	listingID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
@@ -124,10 +145,12 @@ func (h *ShopHandler) AddSdToCart(c *gin.Context) {
 	if req.Quantity <= 0 {
 		req.Quantity = 1
 	}
-	if err := h.Service.AddSdToCart(userID, listingID, req.Quantity); err != nil {
+	prod, err := h.Service.AddSdToCart(userID, listingID, req.Quantity)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	h.notifyCartAdd(userID, prod)
 	c.JSON(http.StatusOK, gin.H{"message": "added to cart"})
 }
 
